@@ -424,7 +424,7 @@ impl StarPassContract {
     // --------------------------------------------------------
 
     /// Check if a fan has a valid (non-expired) pass for a tier
-pub fn has_valid_pass(env: Env, fan: Address, tier_id: u32) -> bool {
+    pub fn has_valid_pass(env: Env, fan: Address, tier_id: u32) -> bool {
         let fan_passes: Vec<u64> = match env.storage().persistent().get(&DataKey::FanPasses(fan)) {
             Some(p) => p,
             None => return false,
