@@ -185,7 +185,7 @@ impl StarPassContract {
         );
         assert!(price > 0, "Price must be greater than zero");
         assert!(duration > 0, "Duration must be greater than zero");
-        assert!(name.len() > 0, "Name cannot be empty");
+        assert!(!name.is_empty(), "Name cannot be empty");
 
         let count: u32 = env
             .storage()
