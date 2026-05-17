@@ -53,6 +53,7 @@ pub enum DataKey {
     Tier(u32), // tier_id -> Tier
     TierCount,
     Pass(u64), // pass_id -> Pass
+    PassCount,
     CreatorBalance(Address), // unclaimed earnings per creator
     FanPasses(Address),      // fan address -> Vec<u64> pass IDs
     CreatorTiers(Address),   // creator address -> Vec<u32> tier IDs
