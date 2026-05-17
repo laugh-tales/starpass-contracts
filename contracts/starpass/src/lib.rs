@@ -280,8 +280,8 @@ impl StarPassContract {
 
     /// Mint a pass for a fan — fan pays USDC, creator receives funds minus protocol fee
     /// Mints a new access pass for a fan after collecting USDC payment.
-   /// Splits payment between the creator and protocol fee.
-   /// Returns the new pass ID.
+    /// Splits payment between the creator and protocol fee.
+    /// Returns the new pass ID.
     pub fn mint_pass(env: Env, fan: Address, tier_id: u32) -> u64 {
         fan.require_auth();
 
