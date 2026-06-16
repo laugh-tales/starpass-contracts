@@ -531,6 +531,44 @@ impl StarPassContract {
             .get(&DataKey::CreatorTiers(creator))
             .unwrap_or(Vec::new(&env))
     }
+
+    /// Get a paginated slice of tier IDs created by a creator.
+    ///
+    /// * `offset` — zero-based start index into the creator's tier list
+    /// * `limit`  — maximum number of tier IDs to return; capped at 20
+    ///
+    /// Returns an empty Vec when `offset` is beyond the end of the list.
+    /// Panics if `limit` exceeds 20.
+    pub fn get_creator_tiers_page(
+        env: Env,
+        creator: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<u32> {
+        assert!(limit <= 20, "limit cannot exceed 20");
+
+        let all: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CreatorTiers(creator))
+            .unwrap_or(Vec::new(&env));
+
+        let total = all.len();
+
+        // offset beyond the end — return empty
+        if offset >= total {
+            return Vec::new(&env);
+        }
+
+        let mut page = Vec::new(&env);
+        let end = (offset + limit).min(total);
+
+        for i in offset..end {
+            page.push_back(all.get(i).unwrap());
+        }
+
+        page
+    }
 }
 
 // ============================================================
@@ -865,5 +903,85 @@ mod tests {
 
         let passes = client.get_fan_passes(&fan);
         assert_eq!(passes.len(), 2);
+    }
+
+    // --------------------------------------------------------
+    // get_creator_tiers_page tests
+    // --------------------------------------------------------
+
+    /// Helper: register a creator and mint `n` tiers, returns their IDs in order.
+    fn create_n_tiers(
+        env: &Env,
+        client: &StarPassContractClient,
+        creator: &Address,
+        n: u32,
+    ) -> soroban_sdk::Vec<u32> {
+        let mut ids = soroban_sdk::Vec::new(env);
+        for i in 0..n {
+            let name = String::from_str(env, "Tier");
+            let _ = name; // silence unused warning
+            let tier_id = client.create_tier(
+                creator,
+                &String::from_str(env, "Tier"),
+                &1_000_000i128,
+                &2_592_000u64,
+                &0u32,
+            );
+            let _ = i;
+            ids.push_back(tier_id);
+        }
+        ids
+    }
+
+    #[test]
+    fn test_creator_tiers_page_first_page() {
+        let (env, contract_id, _admin, creator, _fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+        client.register_creator(&creator);
+        create_n_tiers(&env, &client, &creator, 5);
+
+        // First page: offset=0, limit=3 → tier IDs 1, 2, 3
+        let page = client.get_creator_tiers_page(&creator, &0u32, &3u32);
+        assert_eq!(page.len(), 3);
+        assert_eq!(page.get(0).unwrap(), 1u32);
+        assert_eq!(page.get(1).unwrap(), 2u32);
+        assert_eq!(page.get(2).unwrap(), 3u32);
+    }
+
+    #[test]
+    fn test_creator_tiers_page_last_page() {
+        let (env, contract_id, _admin, creator, _fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+        client.register_creator(&creator);
+        create_n_tiers(&env, &client, &creator, 5);
+
+        // Last page: offset=3, limit=5 → only 2 items remain (tier IDs 4, 5)
+        let page = client.get_creator_tiers_page(&creator, &3u32, &5u32);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.get(0).unwrap(), 4u32);
+        assert_eq!(page.get(1).unwrap(), 5u32);
+    }
+
+    #[test]
+    fn test_creator_tiers_page_offset_beyond_end() {
+        let (env, contract_id, _admin, creator, _fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+        client.register_creator(&creator);
+        create_n_tiers(&env, &client, &creator, 3);
+
+        // offset=10 is past the 3-item list — must return empty, not panic
+        let page = client.get_creator_tiers_page(&creator, &10u32, &5u32);
+        assert_eq!(page.len(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "limit cannot exceed 20")]
+    fn test_creator_tiers_page_limit_exceeded() {
+        let (env, contract_id, _admin, creator, _fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+        client.register_creator(&creator);
+
+        // limit=21 must panic with a clear message
+        client.get_creator_tiers_page(&creator, &0u32, &21u32);
     }
 }

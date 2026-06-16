@@ -63,9 +63,23 @@ Creator calls withdraw() → creator_amount transferred to creator wallet
 ## Functions
 
 - `has_any_valid_pass(env: Env, fan: Address, creator: Address) -> bool`
-  - Returns `true` if the specified fan holds any active, non‑expired pass issued by the given creator. Iterates over the fan’s passes and checks `pass.creator == creator`, `pass.active`, and `pass.expires_at > now`.
-  - Used to determine creator‑exclusive content access regardless of tier.
+  - Returns `true` if the specified fan holds any active, non-expired pass issued by the given creator. Iterates over the fan's passes and checks `pass.creator == creator`, `pass.active`, and `pass.expires_at > now`.
+  - Used to determine creator-exclusive content access regardless of tier.
 
+- `get_creator_tiers(env: Env, creator: Address) -> Vec<u32>`
+  - Returns all tier IDs for a creator as a single list. Suitable for creators with a small number of tiers.
+
+- `get_creator_tiers_page(env: Env, creator: Address, offset: u32, limit: u32) -> Vec<u32>`
+  - Returns a paginated slice of a creator's tier IDs.
+  - `offset` is the zero-based start index; `limit` is the max number of items to return.
+  - `limit` is capped at **20** — panics with `"limit cannot exceed 20"` if exceeded.
+  - Returns an empty `Vec` when `offset` is beyond the end of the list (does not panic).
+  - Use this instead of `get_creator_tiers` for creators with many tiers to avoid hitting Soroban instruction limits.
+
+## Events
+
+| Event | Data |
+|---|---|
 | `initialized` | admin, token, fee_bps |
 | `creator_registered` | creator, timestamp |
 | `tier_created` | tier_id, creator, price, duration |
