@@ -760,6 +760,36 @@ mod tests {
     }
 
     #[test]
+    fn test_expired_pass_returns_false() {
+        let (env, contract_id, _admin, creator, fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+        client.register_creator(&creator);
+
+        // duration: 86_400 seconds (1 day)
+        let duration = 86_400u64;
+        let start = 1_000_000u64;
+
+        let tier_id = client.create_tier(
+            &creator,
+            &String::from_str(&env, "Daily"),
+            &1_000_000i128,
+            &duration,
+            &0u32,
+        );
+
+        // Mint pass at `start`; expires_at = start + duration
+        env.ledger().set_timestamp(start);
+        client.mint_pass(&fan, &tier_id);
+
+        // Before expiry: pass should be valid
+        assert_eq!(client.has_valid_pass(&fan, &tier_id), true);
+
+        // One second past expiry: pass must be invalid
+        env.ledger().set_timestamp(start + duration + 1);
+        assert_eq!(client.has_valid_pass(&fan, &tier_id), false);
+    }
+
+    #[test]
     fn test_get_fan_passes() {
         let (env, contract_id, _admin, creator, fan, token) = setup_env();
         StellarAssetClient::new(&env, &token).mint(&fan, &100_000_000);
