@@ -60,12 +60,12 @@ Creator calls withdraw() → creator_amount transferred to creator wallet
 | `withdraw` | Creator signature |
 | All `get_*` functions | None (read-only) |
 
-## Events
+## Functions
 
-Every state change emits an event for the off-chain indexer:
+- `has_any_valid_pass(env: Env, fan: Address, creator: Address) -> bool`
+  - Returns `true` if the specified fan holds any active, non‑expired pass issued by the given creator. Iterates over the fan’s passes and checks `pass.creator == creator`, `pass.active`, and `pass.expires_at > now`.
+  - Used to determine creator‑exclusive content access regardless of tier.
 
-| Event | Data |
-|---|---|
 | `initialized` | admin, token, fee_bps |
 | `creator_registered` | creator, timestamp |
 | `tier_created` | tier_id, creator, price, duration |
