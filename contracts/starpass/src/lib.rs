@@ -73,7 +73,14 @@ impl StarPassContract {
     // Admin / Initialization
     // --------------------------------------------------------
 
-    /// Initialize the contract with admin, USDC token, and protocol fee
+    /// Initializes the contract with the admin address, USDC token, and protocol fee.
+    ///
+    /// Called once by the deployer. Sets global config and resets tier/pass counters to zero.
+    /// Requires admin signature.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if `fee_bps` exceeds 1000 (10%).
     pub fn initialize(env: Env, admin: Address, token: Address, fee_bps: u32) {
         admin.require_auth();
         assert!(fee_bps <= 1000, "Fee cannot exceed 10%");
@@ -90,7 +97,15 @@ impl StarPassContract {
             .publish((Symbol::new(&env, "initialized"),), (admin, token, fee_bps));
     }
 
-    /// Update protocol fee (admin only)
+    /// Updates the protocol fee charged on each pass purchase.
+    ///
+    /// Admin-only. Takes effect on all future `mint_pass` calls; does not affect passes
+    /// already minted.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the contract has not been initialized.
+    /// - Panics if `fee_bps` exceeds 1000 (10%).
     pub fn set_fee(env: Env, fee_bps: u32) {
         let admin: Address = env
             .storage()
@@ -104,7 +119,14 @@ impl StarPassContract {
             .set(&DataKey::ProtocolFeeBps, &fee_bps);
     }
 
-    /// Withdraw accumulated protocol fees (admin only)
+    /// Withdraws accumulated protocol fees to a recipient address.
+    ///
+    /// Admin-only. Transfers `amount` USDC directly from the contract to `recipient`.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the contract has not been initialized or the token is not set.
+    /// - Panics if `amount` is not greater than zero.
     pub fn withdraw_fees(env: Env, recipient: Address, amount: i128) {
         let admin: Address = env
             .storage()
@@ -130,7 +152,14 @@ impl StarPassContract {
     // Creator Registration
     // --------------------------------------------------------
 
-    /// Register as a creator
+    /// Registers the calling address as a creator on StarPass.
+    ///
+    /// Must be called before `create_tier` or `withdraw`. Initializes the creator's
+    /// profile, balance, and tier list. Requires creator signature.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the address is already registered as a creator.
     pub fn register_creator(env: Env, creator: Address) {
         creator.require_auth();
         assert!(
@@ -167,7 +196,17 @@ impl StarPassContract {
     // Tier Management
     // --------------------------------------------------------
 
-    /// Create a new membership tier
+    /// Creates a new membership tier for a registered creator.
+    ///
+    /// Creator-only. Returns the new `tier_id`. The creator must be registered via
+    /// `register_creator` first. Requires creator signature.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the caller is not a registered creator.
+    /// - Panics if `price` is zero.
+    /// - Panics if `duration` is zero.
+    /// - Panics if `name` is empty.
     pub fn create_tier(
         env: Env,
         creator: Address,
@@ -229,7 +268,16 @@ impl StarPassContract {
         tier_id
     }
 
-    /// Deactivate a tier (creator only)
+    /// Deactivates a tier, preventing any new passes from being minted for it.
+    ///
+    /// Creator-only. Existing passes remain valid until expiry. Requires creator
+    /// signature; the caller must own the tier.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the tier does not exist.
+    /// - Panics if the caller is not the tier's creator.
+    /// - Panics if the tier is already inactive.
     pub fn deactivate_tier(env: Env, creator: Address, tier_id: u32) {
         creator.require_auth();
         let mut tier: Tier = env
@@ -249,7 +297,17 @@ impl StarPassContract {
             .publish((Symbol::new(&env, "tier_deactivated"),), (tier_id, creator));
     }
 
-    /// Update tier price (creator only, only affects future purchases)
+    /// Updates the USDC price of a tier for future purchases.
+    ///
+    /// Creator-only. Does not affect passes already minted. Requires creator
+    /// signature; the caller must own the tier and the tier must be active.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if `new_price` is zero.
+    /// - Panics if the tier does not exist.
+    /// - Panics if the caller is not the tier's creator.
+    /// - Panics if the tier is inactive.
     pub fn update_tier_price(env: Env, creator: Address, tier_id: u32, new_price: i128) {
         creator.require_auth();
         assert!(new_price > 0, "Price must be greater than zero");
@@ -278,10 +336,18 @@ impl StarPassContract {
     // Pass Minting (Fan purchases)
     // --------------------------------------------------------
 
-    /// Mint a pass for a fan — fan pays USDC, creator receives funds minus protocol fee
-    /// Mints a new access pass for a fan after collecting USDC payment.
-    /// Splits payment between the creator and protocol fee.
-    /// Returns the new pass ID.
+    /// Mints a new access pass for a fan by collecting a USDC payment.
+    ///
+    /// Fan-only. The fan pays the full tier price; the contract credits the creator's
+    /// withdrawable balance after deducting the protocol fee. Returns the new `pass_id`.
+    /// Requires fan signature.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the tier does not exist.
+    /// - Panics if the tier is inactive.
+    /// - Panics if the tier has a `max_supply` cap that has already been reached.
+    /// - Panics if the USDC transfer from the fan fails (e.g. insufficient balance).
     pub fn mint_pass(env: Env, fan: Address, tier_id: u32) -> u64 {
         fan.require_auth();
 
@@ -393,7 +459,15 @@ impl StarPassContract {
     // Creator Withdrawals
     // --------------------------------------------------------
 
-    /// Creator withdraws their earned balance
+    /// Withdraws all accumulated earnings to the creator's wallet.
+    ///
+    /// Creator-only. Transfers the full `CreatorBalance` to the creator and resets
+    /// it to zero. Requires creator signature.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the creator has no balance to withdraw.
+    /// - Panics if the USDC transfer fails.
     pub fn withdraw(env: Env, creator: Address) {
         creator.require_auth();
 
@@ -426,7 +500,11 @@ impl StarPassContract {
     // Read / Query Functions
     // --------------------------------------------------------
 
-    /// Check if a fan has a valid (non-expired) pass for a tier
+    /// Returns `true` if the fan holds an active, non-expired pass for `tier_id`.
+    ///
+    /// Read-only, no auth required. Can be called by any app, backend, or contract
+    /// to gate access. A pass is valid when `active == true` and
+    /// `expires_at > current_ledger_timestamp`.
     pub fn has_valid_pass(env: Env, fan: Address, tier_id: u32) -> bool {
         let fan_passes: Vec<u64> = match env.storage().persistent().get(&DataKey::FanPasses(fan)) {
             Some(p) => p,
@@ -447,7 +525,10 @@ impl StarPassContract {
         false
     }
 
-    /// Check if a fan has any valid (non-expired) pass for a creator
+    /// Returns `true` if the fan holds any active, non-expired pass issued by `creator`.
+    ///
+    /// Read-only, no auth required. Use this to gate creator-level content access
+    /// regardless of which specific tier the fan purchased.
     pub fn has_any_valid_pass(env: Env, fan: Address, creator: Address) -> bool {
         let fan_passes: Vec<u64> = match env.storage().persistent().get(&DataKey::FanPasses(fan)) {
             Some(p) => p,
@@ -468,7 +549,13 @@ impl StarPassContract {
         false
     }
 
-    /// Get pass details
+    /// Returns the [`Pass`] struct for the given `pass_id`.
+    ///
+    /// Read-only, no auth required.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if no pass exists with `pass_id`.
     pub fn get_pass(env: Env, pass_id: u64) -> Pass {
         env.storage()
             .persistent()
@@ -476,7 +563,13 @@ impl StarPassContract {
             .expect("Pass not found")
     }
 
-    /// Get tier details
+    /// Returns the [`Tier`] struct for the given `tier_id`.
+    ///
+    /// Read-only, no auth required.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if no tier exists with `tier_id`.
     pub fn get_tier(env: Env, tier_id: u32) -> Tier {
         env.storage()
             .persistent()
@@ -484,7 +577,13 @@ impl StarPassContract {
             .expect("Tier not found")
     }
 
-    /// Get creator profile
+    /// Returns the [`Creator`] profile for the given address.
+    ///
+    /// Read-only, no auth required.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the address has not been registered as a creator.
     pub fn get_creator(env: Env, creator: Address) -> Creator {
         env.storage()
             .persistent()
@@ -492,7 +591,10 @@ impl StarPassContract {
             .expect("Creator not found")
     }
 
-    /// Get creator's pending balance
+    /// Returns the pending withdrawal balance in stroops for the given creator.
+    ///
+    /// Read-only, no auth required. Returns `0` if the creator has no pending
+    /// balance or is not registered.
     pub fn get_creator_balance(env: Env, creator: Address) -> i128 {
         env.storage()
             .persistent()
@@ -500,7 +602,9 @@ impl StarPassContract {
             .unwrap_or(0)
     }
 
-    /// Get total pass count
+    /// Returns the total number of passes ever minted across all creators and tiers.
+    ///
+    /// Read-only, no auth required. Returns `0` before any passes are minted.
     pub fn get_pass_count(env: Env) -> u64 {
         env.storage()
             .instance()
@@ -508,7 +612,9 @@ impl StarPassContract {
             .unwrap_or(0)
     }
 
-    /// Get total tier count
+    /// Returns the total number of tiers ever created across all creators.
+    ///
+    /// Read-only, no auth required. Returns `0` before any tiers are created.
     pub fn get_tier_count(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -516,7 +622,10 @@ impl StarPassContract {
             .unwrap_or(0)
     }
 
-    /// Get all pass IDs owned by a fan
+    /// Returns all pass IDs owned by the given fan address.
+    ///
+    /// Read-only, no auth required. Returns an empty `Vec` if the fan has never
+    /// minted a pass.
     pub fn get_fan_passes(env: Env, fan: Address) -> Vec<u64> {
         env.storage()
             .persistent()
@@ -524,7 +633,10 @@ impl StarPassContract {
             .unwrap_or(Vec::new(&env))
     }
 
-    /// Get all tier IDs created by a creator
+    /// Returns all tier IDs created by the given creator address.
+    ///
+    /// Read-only, no auth required. Returns an empty `Vec` if the creator has
+    /// no tiers or is not registered.
     pub fn get_creator_tiers(env: Env, creator: Address) -> Vec<u32> {
         env.storage()
             .persistent()
@@ -610,9 +722,9 @@ mod tests {
         let tier_id = client.create_tier(
             &creator,
             &String::from_str(&env, "Bronze"),
-            1_000_000i128,
-            2_592_000u64,
-            0u32,
+            &1_000_000i128,
+            &2_592_000u64,
+            &0u32,
         );
         client.mint_pass(&fan, &tier_id);
         assert_eq!(client.has_any_valid_pass(&fan, &creator), true);
