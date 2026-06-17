@@ -64,8 +64,8 @@ Creator calls withdraw() → creator_amount transferred to creator wallet
 ## Functions
 
 - `has_any_valid_pass(env: Env, fan: Address, creator: Address) -> bool`
-  - Returns `true` if the specified fan holds any active, non‑expired pass issued by the given creator. Iterates over the fan’s passes and checks `pass.creator == creator`, `pass.active`, and `pass.expires_at > now`.
-  - Used to determine creator‑exclusive content access regardless of tier.
+  - Returns `true` if the specified fan holds any active, non-expired pass issued by the given creator. Iterates over the fan's passes and checks `pass.creator == creator`, `pass.active`, and `pass.expires_at > now`.
+  - Used to determine creator-exclusive content access regardless of tier.
 
 - `renew_pass(env: Env, fan: Address, pass_id: u64) -> u64`
   - Extends an existing pass instead of minting a new one for the same fan/tier, keeping pass history clean and avoiding duplicate records. Requires `fan.require_auth()`, `pass.owner == fan`, and `pass.active`. Charges `tier.price` USDC with the same fee split as `mint_pass`, crediting `CreatorBalance` and `Creator.total_earned` (does not increment `pass_count`, since no new pass is created).
