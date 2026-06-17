@@ -57,6 +57,7 @@ Creator calls withdraw() → creator_amount transferred to creator wallet
 | `deactivate_tier` | Creator signature (must own the tier) |
 | `update_tier_price` | Creator signature (must own the tier) |
 | `mint_pass` | Fan signature |
+| `renew_pass` | Fan signature (must own the pass) |
 | `withdraw` | Creator signature |
 | All `get_*` functions | None (read-only) |
 
@@ -66,25 +67,16 @@ Creator calls withdraw() → creator_amount transferred to creator wallet
   - Returns `true` if the specified fan holds any active, non-expired pass issued by the given creator. Iterates over the fan's passes and checks `pass.creator == creator`, `pass.active`, and `pass.expires_at > now`.
   - Used to determine creator-exclusive content access regardless of tier.
 
-- `get_creator_tiers(env: Env, creator: Address) -> Vec<u32>`
-  - Returns all tier IDs for a creator as a single list. Suitable for creators with a small number of tiers.
+- `renew_pass(env: Env, fan: Address, pass_id: u64) -> u64`
+  - Extends an existing pass instead of minting a new one for the same fan/tier, keeping pass history clean and avoiding duplicate records. Requires `fan.require_auth()`, `pass.owner == fan`, and `pass.active`. Charges `tier.price` USDC with the same fee split as `mint_pass`, crediting `CreatorBalance` and `Creator.total_earned` (does not increment `pass_count`, since no new pass is created).
+  - New expiry is `tier.duration` seconds added to `max(now, pass.expires_at)` — renewing before expiry stacks onto remaining time; renewing after expiry starts the new period from now. Returns the new `expires_at`.
 
-- `get_creator_tiers_page(env: Env, creator: Address, offset: u32, limit: u32) -> Vec<u32>`
-  - Returns a paginated slice of a creator's tier IDs.
-  - `offset` is the zero-based start index; `limit` is the max number of items to return.
-  - `limit` is capped at **20** — panics with `"limit cannot exceed 20"` if exceeded.
-  - Returns an empty `Vec` when `offset` is beyond the end of the list (does not panic).
-  - Use this instead of `get_creator_tiers` for creators with many tiers to avoid hitting Soroban instruction limits.
-
-## Events
-
-| Event | Data |
-|---|---|
 | `initialized` | admin, token, fee_bps |
 | `creator_registered` | creator, timestamp |
 | `tier_created` | tier_id, creator, price, duration |
 | `tier_deactivated` | tier_id, creator |
 | `tier_price_updated` | tier_id, old_price, new_price |
 | `pass_minted` | pass_id, tier_id, fan, expires_at |
+| `pass_renewed` | pass_id, fan, new_expires_at |
 | `creator_withdrew` | creator, amount |
 | `fees_withdrawn` | recipient, amount |
