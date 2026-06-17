@@ -1,6 +1,6 @@
 {
   "generators": {
-    "address": 6,
+    "address": 7,
     "nonce": 0
   },
   "auth": [
@@ -92,7 +92,6 @@
         }
       ]
     ],
-    [],
     [
       [
         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
@@ -173,13 +172,12 @@
         }
       ]
     ],
-    [],
     []
   ],
   "ledger": {
     "protocol_version": 21,
     "sequence_number": 0,
-    "timestamp": 2592001,
+    "timestamp": 0,
     "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
     "base_reserve": 0,
     "min_persistent_entry_ttl": 4096,
@@ -1622,62 +1620,6 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000006"
               },
               {
-                "symbol": "has_any_valid_pass"
-              }
-            ],
-            "data": {
-              "vec": [
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                }
-              ]
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000006",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_return"
-              },
-              {
-                "symbol": "has_any_valid_pass"
-              }
-            ],
-            "data": {
-              "bool": false
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": null,
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_call"
-              },
-              {
-                "bytes": "0000000000000000000000000000000000000000000000000000000000000006"
-              },
-              {
                 "symbol": "create_tier"
               }
             ],
@@ -1963,16 +1905,16 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000006"
               },
               {
-                "symbol": "has_any_valid_pass"
+                "symbol": "renew_pass"
               }
             ],
             "data": {
               "vec": [
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
                 },
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                  "u64": 1
                 }
               ]
             }
@@ -1990,19 +1932,51 @@
           "v0": {
             "topics": [
               {
-                "symbol": "fn_return"
-              },
-              {
-                "symbol": "has_any_valid_pass"
+                "symbol": "log"
               }
             ],
             "data": {
-              "bool": true
+              "vec": [
+                {
+                  "string": "caught panic 'Not the pass owner' from contract function 'Symbol(obj#453)'"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                },
+                {
+                  "u64": 1
+                }
+              ]
             }
           }
         }
       },
-      "failed_call": false
+      "failed_call": true
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000006",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "error"
+              },
+              {
+                "error": {
+                  "wasm_vm": "invalid_action"
+                }
+              }
+            ],
+            "data": {
+              "string": "caught error from function"
+            }
+          }
+        }
+      },
+      "failed_call": true
     },
     {
       "event": {
@@ -2013,47 +1987,33 @@
           "v0": {
             "topics": [
               {
-                "symbol": "fn_call"
+                "symbol": "error"
               },
               {
-                "bytes": "0000000000000000000000000000000000000000000000000000000000000006"
-              },
-              {
-                "symbol": "has_any_valid_pass"
+                "error": {
+                  "wasm_vm": "invalid_action"
+                }
               }
             ],
             "data": {
               "vec": [
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                  "string": "contract try_call failed"
                 },
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                  "symbol": "renew_pass"
+                },
+                {
+                  "vec": [
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                    },
+                    {
+                      "u64": 1
+                    }
+                  ]
                 }
               ]
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000006",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_return"
-              },
-              {
-                "symbol": "has_any_valid_pass"
-              }
-            ],
-            "data": {
-              "bool": false
             }
           }
         }

@@ -390,6 +390,97 @@ impl StarPassContract {
     }
 
     // --------------------------------------------------------
+    // Pass Renewal
+    // --------------------------------------------------------
+
+    /// Renew an existing pass — fan pays tier.price again (same fee split as
+    /// mint_pass), extending expiry by one tier duration from whichever is
+    /// later: the current ledger timestamp or the pass's current expiry.
+    /// Renewing before expiry stacks on top of remaining time instead of
+    /// resetting it. Returns the pass's new expiration timestamp.
+    pub fn renew_pass(env: Env, fan: Address, pass_id: u64) -> u64 {
+        fan.require_auth();
+
+        let mut pass: Pass = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Pass(pass_id))
+            .expect("Pass not found");
+
+        assert!(pass.owner == fan, "Not the pass owner");
+        assert!(pass.active, "Pass is not active");
+
+        let tier: Tier = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Tier(pass.tier_id))
+            .expect("Tier not found");
+
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("Token not set");
+        let fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProtocolFeeBps)
+            .unwrap_or(0);
+
+        // Calculate fee split (same as mint_pass)
+        let protocol_fee = (tier.price * fee_bps as i128) / 10_000;
+        let creator_amount = tier.price - protocol_fee;
+
+        // Transfer full price from fan to contract
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&fan, &env.current_contract_address(), &tier.price);
+
+        // Credit creator's balance
+        let current_balance: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CreatorBalance(tier.creator.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::CreatorBalance(tier.creator.clone()),
+            &(current_balance + creator_amount),
+        );
+
+        // Update creator profile
+        let mut creator_profile: Creator = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Creator(tier.creator.clone()))
+            .expect("Creator not found");
+        creator_profile.total_earned += creator_amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Creator(tier.creator.clone()), &creator_profile);
+
+        // Extend from whichever is later — rewards early renewal by not
+        // discarding remaining time on the existing pass.
+        let now = env.ledger().timestamp();
+        let extend_from = if pass.expires_at > now {
+            pass.expires_at
+        } else {
+            now
+        };
+        let new_expires_at = extend_from + tier.duration;
+        pass.expires_at = new_expires_at;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Pass(pass_id), &pass);
+
+        env.events().publish(
+            (Symbol::new(&env, "pass_renewed"),),
+            (pass_id, fan, new_expires_at),
+        );
+
+        new_expires_at
+    }
+
+    // --------------------------------------------------------
     // Creator Withdrawals
     // --------------------------------------------------------
 
@@ -610,9 +701,9 @@ mod tests {
         let tier_id = client.create_tier(
             &creator,
             &String::from_str(&env, "Bronze"),
-            1_000_000i128,
-            2_592_000u64,
-            0u32,
+            &1_000_000i128,
+            &2_592_000u64,
+            &0u32,
         );
         client.mint_pass(&fan, &tier_id);
         assert_eq!(client.has_any_valid_pass(&fan, &creator), true);
@@ -836,6 +927,101 @@ mod tests {
         // One second past expiry: pass must be invalid
         env.ledger().set_timestamp(start + duration + 1);
         assert_eq!(client.has_valid_pass(&fan, &tier_id), false);
+    }
+
+    #[test]
+    fn test_renew_pass_before_expiry() {
+        let (env, contract_id, _admin, creator, fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+        client.register_creator(&creator);
+
+        let duration = 2_592_000u64;
+        let start = 1_000_000u64;
+        env.ledger().set_timestamp(start);
+
+        let tier_id = client.create_tier(
+            &creator,
+            &String::from_str(&env, "Bronze"),
+            &1_000_000i128,
+            &duration,
+            &0u32,
+        );
+
+        let pass_id = client.mint_pass(&fan, &tier_id);
+        let original_expires_at = client.get_pass(&pass_id).expires_at;
+        assert_eq!(original_expires_at, start + duration);
+
+        // Renew well before expiry — should extend from current expires_at,
+        // not from "now", rewarding early renewal.
+        env.ledger().set_timestamp(start + 1_000);
+        let new_expires_at = client.renew_pass(&fan, &pass_id);
+
+        assert_eq!(new_expires_at, original_expires_at + duration);
+        let pass = client.get_pass(&pass_id);
+        assert_eq!(pass.expires_at, new_expires_at);
+        assert!(pass.active);
+
+        // Fee split applied twice (mint + renewal), pass_count untouched.
+        assert_eq!(client.get_creator_balance(&creator), 975_000 * 2);
+        let profile = client.get_creator(&creator);
+        assert_eq!(profile.total_earned, 975_000 * 2);
+        assert_eq!(profile.pass_count, 1);
+    }
+
+    #[test]
+    fn test_renew_pass_after_expiry() {
+        let (env, contract_id, _admin, creator, fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+        client.register_creator(&creator);
+
+        let duration = 2_592_000u64;
+        let start = 1_000_000u64;
+        env.ledger().set_timestamp(start);
+
+        let tier_id = client.create_tier(
+            &creator,
+            &String::from_str(&env, "Bronze"),
+            &1_000_000i128,
+            &duration,
+            &0u32,
+        );
+
+        let pass_id = client.mint_pass(&fan, &tier_id);
+        let original_expires_at = client.get_pass(&pass_id).expires_at;
+
+        // Advance past expiry before renewing.
+        let renew_time = original_expires_at + 500;
+        env.ledger().set_timestamp(renew_time);
+        assert!(!client.has_valid_pass(&fan, &tier_id));
+
+        let new_expires_at = client.renew_pass(&fan, &pass_id);
+
+        // Extends from "now" (renew_time), not from the stale expires_at.
+        assert_eq!(new_expires_at, renew_time + duration);
+        let pass = client.get_pass(&pass_id);
+        assert_eq!(pass.expires_at, new_expires_at);
+        assert!(client.has_valid_pass(&fan, &tier_id));
+    }
+
+    #[test]
+    fn test_renew_pass_rejects_non_owner() {
+        let (env, contract_id, _admin, creator, fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+        client.register_creator(&creator);
+
+        let tier_id = client.create_tier(
+            &creator,
+            &String::from_str(&env, "Bronze"),
+            &1_000_000i128,
+            &2_592_000u64,
+            &0u32,
+        );
+
+        let pass_id = client.mint_pass(&fan, &tier_id);
+
+        let impostor = Address::generate(&env);
+        let result = client.try_renew_pass(&impostor, &pass_id);
+        assert!(result.is_err());
     }
 
     #[test]
