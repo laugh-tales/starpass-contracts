@@ -742,12 +742,7 @@ impl StarPassContract {
     ///
     /// Returns an empty Vec when `offset` is beyond the end of the list.
     /// Panics if `limit` exceeds 20.
-    pub fn get_creator_tiers_page(
-        env: Env,
-        creator: Address,
-        offset: u32,
-        limit: u32,
-    ) -> Vec<u32> {
+    pub fn get_creator_tiers_page(env: Env, creator: Address, offset: u32, limit: u32) -> Vec<u32> {
         assert!(limit <= 20, "limit cannot exceed 20");
 
         let all: Vec<u32> = env
