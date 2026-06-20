@@ -1277,4 +1277,53 @@ mod tests {
         // limit=21 must panic with a clear message
         client.get_creator_tiers_page(&creator, &0u32, &21u32);
     }
+
+    #[test]
+    fn test_cannot_deactivate_others_tier() {
+        let (env, contract_id, _admin, creator, _fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+        client.register_creator(&creator);
+
+        let tier_id = client.create_tier(
+            &creator,
+            &String::from_str(&env, "Bronze"),
+            &1_000_000i128,
+            &2_592_000u64,
+            &0u32,
+        );
+
+        let impostor = Address::generate(&env);
+        let result = client.try_deactivate_tier(&impostor, &tier_id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cannot_update_others_tier_price() {
+        let (env, contract_id, _admin, creator, _fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+        client.register_creator(&creator);
+
+        let tier_id = client.create_tier(
+            &creator,
+            &String::from_str(&env, "Silver"),
+            &1_000_000i128,
+            &2_592_000u64,
+            &0u32,
+        );
+
+        let impostor = Address::generate(&env);
+        let result = client.try_update_tier_price(&impostor, &tier_id, &2_000_000i128);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cannot_withdraw_others_balance() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, StarPassContract);
+        let client = StarPassContractClient::new(&env, &contract_id);
+        let creator = Address::generate(&env);
+
+        let result = client.try_withdraw(&creator);
+        assert!(result.is_err());
+    }
 }
