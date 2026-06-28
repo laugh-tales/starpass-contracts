@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, String, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, token, Address, BytesN, Env, String, Symbol, Vec,
+};
 
 // ============================================================
 // Data Types
@@ -93,7 +95,9 @@ impl StarPassContract {
             .set(&DataKey::ProtocolFeeBps, &fee_bps);
         env.storage().instance().set(&DataKey::TierCount, &0u32);
         env.storage().instance().set(&DataKey::PassCount, &0u64);
-        env.storage().instance().set(&DataKey::ContractVersion, &1u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &1u32);
 
         env.events()
             .publish((Symbol::new(&env, "initialized"),), (admin, token, fee_bps));
@@ -778,7 +782,9 @@ impl StarPassContract {
         // v1 -> v2 migration transforms
         // (No storage key changes in this migration; placeholder for future work)
 
-        env.storage().instance().set(&DataKey::ContractVersion, &2u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &2u32);
 
         env.events()
             .publish((Symbol::new(&env, "migrated"),), (version, 2u32));
