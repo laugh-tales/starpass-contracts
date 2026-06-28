@@ -899,6 +899,18 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "ContractVersion"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u32": 1
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "PassCount"
                             }
                           ]
@@ -1938,7 +1950,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'Not the pass owner' from contract function 'Symbol(obj#453)'"
+                  "string": "caught panic 'Not the pass owner' from contract function 'Symbol(obj#465)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
