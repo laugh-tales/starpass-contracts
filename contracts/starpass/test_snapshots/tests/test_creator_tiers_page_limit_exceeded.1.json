@@ -477,6 +477,18 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "ContractVersion"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u32": 1
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "PassCount"
                             }
                           ]
@@ -1161,7 +1173,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'limit cannot exceed 20' from contract function 'Symbol(obj#221)'"
+                  "string": "caught panic 'limit cannot exceed 20' from contract function 'Symbol(obj#225)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"

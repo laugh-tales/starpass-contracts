@@ -477,6 +477,18 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "ContractVersion"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u32": 1
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "PassCount"
                             }
                           ]
@@ -1170,7 +1182,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'Price must be greater than zero' from contract function 'Symbol(obj#223)'"
+                  "string": "caught panic 'Price must be greater than zero' from contract function 'Symbol(obj#227)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
