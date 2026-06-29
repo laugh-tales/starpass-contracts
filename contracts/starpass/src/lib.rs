@@ -4,6 +4,23 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, token, Address, BytesN, Env, String, Symbol, Vec,
 };
 
+// IMPLEMENTATION MAP:
+// - Config change: add `LockPeriodSeconds` to `DataKey` and store in `initialize`.
+// - Admin API: `update_lock_period(env, admin, new_period_seconds)` added.
+// - Interception: `mint_pass` and `renew_pass` no longer directly credit
+//   `CreatorBalance`; instead they create `PendingEarning` records keyed by
+//   `(creator, earning_id)` and increment `PendingEarningCount(creator)`.
+// - New types: `PendingEarning` struct added; `Error` enum appended.
+// - Release paths:
+//   * Normal: `process_unlocked_earnings(env, creator)` iterates pending
+//     earnings and moves matured ones to `CreatorBalance` (maturity check: `now > unlocks_at`).
+//   * Early release (2-of-2): `propose_early_release(admin, creator, earning_id)` stores
+//     a proposal in instance storage; `approve_early_release(creator, earning_id)` co-signs
+//     and executes release, removing the proposal.
+// - Storage keys: `PendingEarningCount`, `PendingEarning(creator,id)`, `EarlyReleaseProposal(id)`.
+// - Events: `earning_pending`, `earning_released`, `early_release_proposed`, `early_release_executed`, `lock_period_updated`.
+
+
 // ============================================================
 // Data Types
 // ============================================================
@@ -52,15 +69,71 @@ pub enum DataKey {
     Admin,
     Token,          // USDC token address
     ProtocolFeeBps, // basis points e.g. 250 = 2.5%
+    /// Duration in seconds that earnings are locked before becoming withdrawable
+    LockPeriodSeconds,
     Creator(Address),
     Tier(u32), // tier_id -> Tier
     TierCount,
     Pass(u64), // pass_id -> Pass
     PassCount,
     CreatorBalance(Address), // unclaimed earnings per creator
+    /// Per-creator monotonically incrementing pending earning id counter
+    PendingEarningCount(Address),
+    /// Pending earning record keyed by (creator, earning_id)
+    PendingEarning(Address, u64),
+    /// Early release proposal keyed by earning_id (instance storage)
+    EarlyReleaseProposal(u64),
     FanPasses(Address),      // fan address -> Vec<u64> pass IDs
     CreatorTiers(Address),   // creator address -> Vec<u32> tier IDs
     ContractVersion,
+}
+
+// ============================================================
+// Errors
+// ============================================================
+
+/// Contract-level errors (append-only)
+#[contracttype]
+#[derive(Clone, Debug)]
+pub enum Error {
+    /// lock_period_seconds must be greater than zero
+    // SECURITY: prevents a zero-length lock which would bypass escrow
+    InvalidLockPeriod,
+    /// No PendingEarning exists for the given creator and earning_id
+    EarningNotFound,
+    /// The PendingEarning has already been released
+    // SECURITY: prevents double-release/double-credit
+    EarningAlreadyReleased,
+    /// An early release proposal already exists for this earning_id
+    ProposalAlreadyExists,
+    /// No early release proposal exists for this earning_id
+    NoProposalFound,
+    /// The calling creator does not match the proposal's intended creator
+    // SECURITY: prevents cross-creator approval attacks
+    UnauthorizedApproval,
+    /// process_unlocked_earnings called but earning is not yet matured
+    EarningNotMatured,
+}
+
+/// Pending earning held in escrow until unlock or early release
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PendingEarning {
+    /// The creator address this earning belongs to
+    pub creator: Address,
+    /// Amount of tokens held in this pending earning
+    pub amount: i128,
+    /// Token contract address for this earning
+    pub token: Address,
+    /// Ledger timestamp (seconds) after which this earning can be released
+    /// via `process_unlocked_earnings`.
+    pub unlocks_at: u64,
+    /// Whether this earning has been released (to creator balance or via early release).
+    /// Released earnings are retained in storage for auditability but ignored by
+    /// processing functions.
+    pub released: bool,
+    /// earning_id — unique per creator, assigned from PendingEarningCount(creator)
+    pub earning_id: u64,
 }
 
 // ============================================================
@@ -84,9 +157,18 @@ impl StarPassContract {
     /// # Panics
     ///
     /// - Panics if `fee_bps` exceeds 1000 (10%).
-    pub fn initialize(env: Env, admin: Address, token: Address, fee_bps: u32) {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        token: Address,
+        fee_bps: u32,
+        lock_period_seconds: u64,
+    ) -> Result<(), Error> {
         admin.require_auth();
         assert!(fee_bps <= 1000, "Fee cannot exceed 10%");
+        if lock_period_seconds == 0 {
+            return Err(Error::InvalidLockPeriod);
+        }
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
@@ -99,8 +181,12 @@ impl StarPassContract {
             .instance()
             .set(&DataKey::ContractVersion, &1u32);
 
-        env.events()
-            .publish((Symbol::new(&env, "initialized"),), (admin, token, fee_bps));
+        env.events().publish(
+            (Symbol::new(&env, "initialized"),),
+            (admin, token, fee_bps, lock_period_seconds),
+        );
+
+        Ok(())
     }
 
     /// Updates the protocol fee charged on each pass purchase.
@@ -123,6 +209,25 @@ impl StarPassContract {
         env.storage()
             .instance()
             .set(&DataKey::ProtocolFeeBps, &fee_bps);
+    }
+
+    /// Updates the lock period for future PendingEarning records.
+    ///
+    /// Requires admin authentication.
+    pub fn update_lock_period(env: Env, admin: Address, new_period_seconds: u64) -> Result<(), Error> {
+        admin.require_auth();
+        if new_period_seconds == 0 {
+            return Err(Error::InvalidLockPeriod);
+        }
+        let old: u64 = env.storage().instance().get(&DataKey::LockPeriodSeconds).unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::LockPeriodSeconds, &new_period_seconds);
+        env.events().publish(
+            (Symbol::new(&env, "lock_period_updated"),),
+            (old, new_period_seconds),
+        );
+        Ok(())
     }
 
     /// Withdraws accumulated protocol fees to a recipient address.
@@ -388,15 +493,37 @@ impl StarPassContract {
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&fan, &env.current_contract_address(), &tier.price);
 
-        // Credit creator's balance
-        let current_balance: i128 = env
-            .storage()
+        // ESCROW: create PendingEarning instead of directly crediting creator balance
+        // Earnings are locked for lock_period_seconds before becoming withdrawable.
+        // See `process_unlocked_earnings()` to release matured earnings.
+        let earning_id = {
+            let cnt: u64 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PendingEarningCount(tier.creator.clone()))
+                .unwrap_or(0u64);
+            let next = cnt + 1u64;
+            env.storage()
+                .persistent()
+                .set(&DataKey::PendingEarningCount(tier.creator.clone()), &next);
+            cnt
+        };
+        let lock_period: u64 = env.storage().instance().get(&DataKey::LockPeriodSeconds).unwrap_or(0u64);
+        let unlocks_at = env.ledger().timestamp().saturating_add(lock_period); // ARITHMETIC: saturating
+        let pending = PendingEarning {
+            creator: tier.creator.clone(),
+            amount: creator_amount,
+            token: token.clone(),
+            unlocks_at,
+            released: false,
+            earning_id,
+        };
+        env.storage()
             .persistent()
-            .get(&DataKey::CreatorBalance(tier.creator.clone()))
-            .unwrap_or(0);
-        env.storage().persistent().set(
-            &DataKey::CreatorBalance(tier.creator.clone()),
-            &(current_balance + creator_amount),
+            .set(&DataKey::PendingEarning(tier.creator.clone(), earning_id), &pending);
+        env.events().publish(
+            (Symbol::new(&env, "earning_pending"),),
+            (tier.creator.clone(), earning_id, creator_amount, unlocks_at),
         );
 
         // Update creator profile
@@ -507,15 +634,35 @@ impl StarPassContract {
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&fan, &env.current_contract_address(), &tier.price);
 
-        // Credit creator's balance
-        let current_balance: i128 = env
-            .storage()
+        // ESCROW: create PendingEarning instead of directly crediting creator balance
+        let earning_id = {
+            let cnt: u64 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PendingEarningCount(tier.creator.clone()))
+                .unwrap_or(0u64);
+            let next = cnt + 1u64;
+            env.storage()
+                .persistent()
+                .set(&DataKey::PendingEarningCount(tier.creator.clone()), &next);
+            cnt
+        };
+        let lock_period: u64 = env.storage().instance().get(&DataKey::LockPeriodSeconds).unwrap_or(0u64);
+        let unlocks_at = env.ledger().timestamp().saturating_add(lock_period); // ARITHMETIC: saturating
+        let pending = PendingEarning {
+            creator: tier.creator.clone(),
+            amount: creator_amount,
+            token: token.clone(),
+            unlocks_at,
+            released: false,
+            earning_id,
+        };
+        env.storage()
             .persistent()
-            .get(&DataKey::CreatorBalance(tier.creator.clone()))
-            .unwrap_or(0);
-        env.storage().persistent().set(
-            &DataKey::CreatorBalance(tier.creator.clone()),
-            &(current_balance + creator_amount),
+            .set(&DataKey::PendingEarning(tier.creator.clone(), earning_id), &pending);
+        env.events().publish(
+            (Symbol::new(&env, "earning_pending"),),
+            (tier.creator.clone(), earning_id, creator_amount, unlocks_at),
         );
 
         // Update creator profile
@@ -591,6 +738,139 @@ impl StarPassContract {
 
         env.events()
             .publish((Symbol::new(&env, "creator_withdrew"),), (creator, balance));
+    }
+
+    /// Moves all matured PendingEarning records for creator to the creator's
+    /// withdrawable balance.
+    ///
+    /// No authentication required — anyone can call this to process
+    /// a creator's matured earnings.
+    pub fn process_unlocked_earnings(env: Env, creator: Address) -> Result<u32, Error> {
+        let count: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingEarningCount(creator.clone()))
+            .unwrap_or(0u64);
+        if count == 0 {
+            return Ok(0);
+        }
+        let mut released = 0u32;
+        let now = env.ledger().timestamp();
+        for id in 0..count {
+            let key = DataKey::PendingEarning(creator.clone(), id);
+            let mut pending: PendingEarning = match env.storage().persistent().get(&key) {
+                Some(p) => p,
+                None => continue,
+            };
+            // SECURITY: strictly greater than
+            if !pending.released && now > pending.unlocks_at {
+                pending.released = true;
+                env.storage().persistent().set(&key, &pending);
+                // credit creator balance
+                let current_balance: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::CreatorBalance(creator.clone()))
+                    .unwrap_or(0);
+                env.storage().persistent().set(
+                    &DataKey::CreatorBalance(creator.clone()),
+                    &(current_balance + pending.amount),
+                );
+                released += 1;
+                env.events().publish(
+                    (Symbol::new(&env, "earning_released"),),
+                    (creator.clone(), pending.earning_id, pending.amount, now),
+                );
+            }
+        }
+        Ok(released)
+    }
+
+    /// Admin proposes an early release for a specific PendingEarning.
+    /// Stores a proposal in instance storage. Requires admin auth.
+    pub fn propose_early_release(
+        env: Env,
+        admin: Address,
+        creator: Address,
+        earning_id: u64,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let key = DataKey::PendingEarning(creator.clone(), earning_id);
+        let pending: PendingEarning = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::EarningNotFound)?;
+        if pending.released {
+            return Err(Error::EarningAlreadyReleased);
+        }
+        let prop_key = DataKey::EarlyReleaseProposal(earning_id);
+        if env.storage().instance().has(&prop_key) {
+            return Err(Error::ProposalAlreadyExists);
+        }
+        let proposal = (admin.clone(), creator.clone(), earning_id, env.ledger().timestamp());
+        env.storage().instance().set(&prop_key, &proposal);
+        env.events().publish(
+            (Symbol::new(&env, "early_release_proposed"),),
+            (admin, creator, earning_id, env.ledger().timestamp()),
+        );
+        Ok(())
+    }
+
+    /// Creator approves an admin early release proposal, executing the release.
+    pub fn approve_early_release(env: Env, creator: Address, earning_id: u64) -> Result<(), Error> {
+        creator.require_auth();
+        let prop_key = DataKey::EarlyReleaseProposal(earning_id);
+        let proposal: (Address, Address, u64, u64) = env
+            .storage()
+            .instance()
+            .get(&prop_key)
+            .ok_or(Error::NoProposalFound)?;
+        let (admin, prop_creator, _id, _proposed_at) = proposal.clone();
+        if prop_creator != creator {
+            return Err(Error::UnauthorizedApproval);
+        }
+        let key = DataKey::PendingEarning(creator.clone(), earning_id);
+        let mut pending: PendingEarning = env.storage().persistent().get(&key).ok_or(Error::EarningNotFound)?;
+        if pending.released {
+            return Err(Error::EarningAlreadyReleased);
+        }
+        // MULTISIG: both admin (proposal) and creator (this call) have signed
+        pending.released = true;
+        env.storage().persistent().set(&key, &pending);
+        // credit creator balance
+        let current_balance: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CreatorBalance(creator.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::CreatorBalance(creator.clone()),
+            &(current_balance + pending.amount),
+        );
+        // remove proposal
+        env.storage().instance().remove(&prop_key);
+        env.events().publish(
+            (Symbol::new(&env, "early_release_executed"),),
+            (admin, creator, earning_id, pending.amount, env.ledger().timestamp()),
+        );
+        Ok(())
+    }
+
+    /// Returns all PendingEarning records for creator, including released ones.
+    pub fn get_pending_earnings(env: Env, creator: Address) -> Vec<PendingEarning> {
+        let count: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingEarningCount(creator.clone()))
+            .unwrap_or(0u64);
+        let mut out: Vec<PendingEarning> = Vec::new(&env);
+        for id in 0..count {
+            if let Some(p) = env.storage().persistent().get(&DataKey::PendingEarning(creator.clone(), id)) {
+                out.push_back(p);
+            }
+        }
+        out
     }
 
     // --------------------------------------------------------
@@ -847,7 +1127,8 @@ mod tests {
 
         let contract_id = env.register_contract(None, StarPassContract);
         let client = StarPassContractClient::new(&env, &contract_id);
-        client.initialize(&admin, &token, &250u32);
+        let res = client.initialize(&admin, &token, &250u32, &3600u64);
+        assert!(res.is_ok());
 
         (env, contract_id, admin, creator, fan, token)
     }
@@ -864,7 +1145,8 @@ mod tests {
 
         let contract_id = env.register_contract(None, StarPassContract);
         let client = StarPassContractClient::new(&env, &contract_id);
-        client.initialize(&admin, &token, &250u32);
+        let res = client.initialize(&admin, &token, &250u32, &3600u64);
+        assert!(res.is_ok());
 
         assert_eq!(client.get_pass_count(), 0);
         assert_eq!(client.get_tier_count(), 0);
@@ -989,7 +1271,15 @@ mod tests {
             &0u32,
         );
 
+        let now = env.ledger().timestamp(); // ARRANGE: record time of purchase
         client.mint_pass(&fan, &tier_id);
+        // ACT: advance ledger past lock and process unlocked earnings
+        env.ledger().set_timestamp(now + 3600 + 1);
+        let res = client.process_unlocked_earnings(&creator);
+        match res {
+            Ok(n) => assert_eq!(n, 1u32),
+            Err(_) => panic!("process_unlocked_earnings failed"),
+        }
         let creator_balance = client.get_creator_balance(&creator);
         assert_eq!(creator_balance, 975_000);
     }
@@ -1008,7 +1298,14 @@ mod tests {
             &0u32,
         );
 
+        let start = env.ledger().timestamp();
         client.mint_pass(&fan, &tier_id);
+        env.ledger().set_timestamp(start + 3600 + 1);
+        let res = client.process_unlocked_earnings(&creator);
+        match res {
+            Ok(n) => assert_eq!(n, 1u32),
+            Err(_) => panic!("process_unlocked_earnings failed"),
+        }
         assert_eq!(client.get_creator_balance(&creator), 975_000);
 
         client.withdraw(&creator);
@@ -1155,6 +1452,13 @@ mod tests {
         assert!(pass.active);
 
         // Fee split applied twice (mint + renewal), pass_count untouched.
+        // ACT: advance ledger past both unlocks and process
+        env.ledger().set_timestamp(start + 1_000 + 3600 + 1);
+        let res = client.process_unlocked_earnings(&creator);
+        match res {
+            Ok(n) => assert_eq!(n, 2u32),
+            Err(_) => panic!("process_unlocked_earnings failed"),
+        }
         assert_eq!(client.get_creator_balance(&creator), 975_000 * 2);
         let profile = client.get_creator(&creator);
         assert_eq!(profile.total_earned, 975_000 * 2);
