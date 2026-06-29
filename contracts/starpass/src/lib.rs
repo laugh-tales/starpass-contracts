@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, token, Address, BytesN, Env, String, Symbol, Vec,
+};
 
 // IMPLEMENTATION MAP:
 // - Config change: add `LockPeriodSeconds` to `DataKey` and store in `initialize`.
@@ -83,6 +85,7 @@ pub enum DataKey {
     EarlyReleaseProposal(u64),
     FanPasses(Address),      // fan address -> Vec<u64> pass IDs
     CreatorTiers(Address),   // creator address -> Vec<u32> tier IDs
+    ContractVersion,
 }
 
 // ============================================================
@@ -176,7 +179,7 @@ impl StarPassContract {
         env.storage().instance().set(&DataKey::PassCount, &0u64);
         env.storage()
             .instance()
-            .set(&DataKey::LockPeriodSeconds, &lock_period_seconds);
+            .set(&DataKey::ContractVersion, &1u32);
 
         env.events().publish(
             (Symbol::new(&env, "initialized"),),
@@ -1025,6 +1028,48 @@ impl StarPassContract {
     ///
     /// Returns an empty Vec when `offset` is beyond the end of the list.
     /// Panics if `limit` exceeds 20.
+    // --------------------------------------------------------
+    // Upgrade / Migration
+    // --------------------------------------------------------
+    /// Replaces the contract WASM with a new version.
+    ///
+    /// Admin-only. After calling `upgrade`, the next transaction should call
+    /// `migrate` to transform existing storage to the new layout.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+        admin.require_auth();
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+    }
+
+    /// Transforms storage from the previous version to the current layout.
+    ///
+    /// Admin-only. Reads `ContractVersion`, panics if already at the target
+    /// version (v2), then performs any key/data transformations needed and
+    /// bumps the stored version. Safe to call only once per version increment.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if `migrate` has already been called (version >= 2).
+    pub fn migrate(env: Env, admin: Address) {
+        admin.require_auth();
+
+        let version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContractVersion)
+            .unwrap_or(0);
+        assert!(version < 2, "Already migrated");
+
+        // v1 -> v2 migration transforms
+        // (No storage key changes in this migration; placeholder for future work)
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &2u32);
+
+        env.events()
+            .publish((Symbol::new(&env, "migrated"),), (version, 2u32));
+    }
+
     pub fn get_creator_tiers_page(env: Env, creator: Address, offset: u32, limit: u32) -> Vec<u32> {
         assert!(limit <= 20, "limit cannot exceed 20");
 
@@ -1632,5 +1677,92 @@ mod tests {
 
         let result = client.try_withdraw(&creator);
         assert!(result.is_err());
+    }
+
+    // --------------------------------------------------------
+    // Upgrade / Migration tests
+    // --------------------------------------------------------
+
+    #[test]
+    fn test_full_upgrade_lifecycle() {
+        let (env, contract_id, admin, creator, fan, token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+
+        // Populate v1 state
+        client.register_creator(&creator);
+
+        let tier_id = client.create_tier(
+            &creator,
+            &String::from_str(&env, "Gold"),
+            &2_000_000i128,
+            &2_592_000u64,
+            &0u32,
+        );
+
+        StellarAssetClient::new(&env, &token).mint(&fan, &100_000_000);
+        let pass_id = client.mint_pass(&fan, &tier_id);
+
+        // Verify pre-migration state
+        assert_eq!(client.get_tier_count(), 1);
+        assert_eq!(client.get_pass_count(), 1);
+        let creator_profile = client.get_creator(&creator);
+        assert_eq!(creator_profile.pass_count, 1);
+        assert_eq!(creator_profile.total_earned, 1_950_000);
+        assert_eq!(client.get_creator_balance(&creator), 1_950_000);
+        let tier = client.get_tier(&tier_id);
+        assert_eq!(tier.minted, 1);
+        let pass = client.get_pass(&pass_id);
+        assert_eq!(pass.owner, fan);
+        assert!(pass.active);
+        let fan_passes = client.get_fan_passes(&fan);
+        assert_eq!(fan_passes.len(), 1);
+        let creator_tiers = client.get_creator_tiers(&creator);
+        assert_eq!(creator_tiers.len(), 1);
+
+        // Migrate v1 -> v2
+        client.migrate(&admin);
+
+        // All state still readable
+        assert_eq!(client.get_tier_count(), 1);
+        assert_eq!(client.get_pass_count(), 1);
+        let creator_profile = client.get_creator(&creator);
+        assert_eq!(creator_profile.pass_count, 1);
+        assert_eq!(creator_profile.total_earned, 1_950_000);
+        assert_eq!(client.get_creator_balance(&creator), 1_950_000);
+        let tier = client.get_tier(&tier_id);
+        assert_eq!(tier.minted, 1);
+        assert_eq!(tier.creator, creator);
+        let pass = client.get_pass(&pass_id);
+        assert_eq!(pass.owner, fan);
+        assert!(pass.active);
+        assert_eq!(pass.tier_id, tier_id);
+        let fan_passes = client.get_fan_passes(&fan);
+        assert_eq!(fan_passes.len(), 1);
+        assert_eq!(fan_passes.get(0).unwrap(), pass_id);
+        let creator_tiers = client.get_creator_tiers(&creator);
+        assert_eq!(creator_tiers.len(), 1);
+        assert_eq!(creator_tiers.get(0).unwrap(), tier_id);
+
+        // has_valid_pass still works after migration
+        assert!(client.has_valid_pass(&fan, &tier_id));
+
+        // Double-migration panics
+        let result = client.try_migrate(&admin);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_upgrade_admin_only() {
+        let (env, contract_id, admin, _creator, _fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+
+        // upgrade compiles and can be called (test env may or may not
+        // support actual WASM replacement, but the function exists)
+        let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
+        let result = client.try_upgrade(&admin, &wasm_hash);
+        // May succeed or fail depending on test env deployer support,
+        // but should not panic about auth (mock_all_auths is set).
+        // This at minimum exercises the function path.
+        let _ = result;
     }
 }

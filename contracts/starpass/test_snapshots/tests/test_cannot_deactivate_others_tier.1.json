@@ -661,6 +661,18 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "ContractVersion"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u32": 1
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "PassCount"
                             }
                           ]
@@ -1446,7 +1458,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'Not the tier creator' from contract function 'Symbol(obj#283)'"
+                  "string": "caught panic 'Not the tier creator' from contract function 'Symbol(obj#291)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
