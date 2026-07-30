@@ -53,6 +53,7 @@ pub struct Tier {
     pub max_supply: u32,      // 0 = unlimited
     pub minted: u32,
     pub active: bool,
+    pub permissions: Vec<Symbol>, // named permissions defined by creator
 }
 
 /// An access pass owned by a fan
@@ -70,6 +71,7 @@ pub struct Pass {
     pub paused: bool,
     pub paused_at: u64,
     pub total_paused_seconds: u64,
+    pub pass_permissions: Vec<Symbol>, // subset of tier permissions granted at mint
 }
 
 /// Creator profile registered on-chain
@@ -80,6 +82,16 @@ pub struct Creator {
     pub registered_at: u64,
     pub total_earned: i128,
     pub pass_count: u64,
+}
+
+/// Temporary permission grant from creator to fan
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PermissionGrant {
+    pub fan: Address,
+    pub tier_id: u32,
+    pub permissions: Vec<Symbol>,
+    pub expires_at: u64,
 }
 
 /// Storage keys
@@ -108,6 +120,8 @@ pub enum DataKey {
     FanPasses(Address),    // fan address -> Vec<u64> pass IDs
     CreatorTiers(Address), // creator address -> Vec<u32> tier IDs
     ContractVersion,
+    /// Permission grant keyed by (fan, tier_id)
+    PermissionGrant(Address, u32),
 }
 
 // ============================================================
@@ -455,6 +469,7 @@ impl StarPassContract {
         price: i128,
         duration: u64,
         max_supply: u32,
+        permissions: Vec<Symbol>,
     ) -> u32 {
         assert!(price > 0, "Price must be greater than zero");
         Self::create_tier_priced(
@@ -464,6 +479,7 @@ impl StarPassContract {
             TierPriceMode::Fixed(price),
             duration,
             max_supply,
+            permissions,
         )
     }
 
@@ -486,6 +502,7 @@ impl StarPassContract {
         usd_price_cents: i128,
         duration: u64,
         max_supply: u32,
+        permissions: Vec<Symbol>,
     ) -> u32 {
         assert!(usd_price_cents > 0, "Price must be greater than zero");
         Self::create_tier_priced(
@@ -495,6 +512,7 @@ impl StarPassContract {
             TierPriceMode::USDDenominated(usd_price_cents),
             duration,
             max_supply,
+            permissions,
         )
     }
 
@@ -505,6 +523,7 @@ impl StarPassContract {
         price: TierPriceMode,
         duration: u64,
         max_supply: u32,
+        permissions: Vec<Symbol>,
     ) -> u32 {
         creator.require_auth();
         assert!(
@@ -532,6 +551,7 @@ impl StarPassContract {
             max_supply,
             minted: 0,
             active: true,
+            permissions,
         };
 
         env.storage()
@@ -687,7 +707,8 @@ impl StarPassContract {
     /// - Panics if the tier is inactive.
     /// - Panics if the tier has a `max_supply` cap that has already been reached.
     /// - Panics if the USDC transfer from the fan fails (e.g. insufficient balance).
-    pub fn mint_pass(env: Env, fan: Address, tier_id: u32) -> u64 {
+    /// - Panics if any pass_permission is not in the tier's permissions.
+    pub fn mint_pass(env: Env, fan: Address, tier_id: u32, pass_permissions: Vec<Symbol>) -> u64 {
         fan.require_auth();
 
         let mut tier: Tier = env
@@ -701,6 +722,18 @@ impl StarPassContract {
             tier.max_supply == 0 || tier.minted < tier.max_supply,
             "Tier is sold out"
         );
+
+        // Validate that all pass_permissions are in tier's permissions
+        for perm in pass_permissions.iter() {
+            let mut found = false;
+            for tier_perm in tier.permissions.iter() {
+                if tier_perm == perm {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found, "Permission not in tier definition");
+        }
 
         let token: Address = env
             .storage()
@@ -796,6 +829,7 @@ impl StarPassContract {
             paused: false,
             paused_at: 0,
             total_paused_seconds: 0,
+            pass_permissions,
         };
 
         env.storage()
@@ -1300,6 +1334,148 @@ impl StarPassContract {
         }
 
         false
+    }
+
+    /// Returns `true` if the fan has the specified permission for the tier.
+    ///
+    /// Checks both pass permissions and active permission grants. A fan has a permission
+    /// if they hold an active, non-expired pass for the tier that grants the permission,
+    /// or if they have an active, non-expired permission grant from the tier's creator.
+    ///
+    /// Read-only, no auth required.
+    pub fn has_permission(env: Env, fan: Address, tier_id: u32, permission: Symbol) -> bool {
+        let now = env.ledger().timestamp();
+
+        // Check pass-based permissions
+        let fan_passes: Vec<u64> = match env.storage().persistent().get(&DataKey::FanPasses(fan.clone())) {
+            Some(p) => p,
+            None => return false,
+        };
+
+        for pass_id in fan_passes.iter() {
+            let pass: Pass = match env.storage().persistent().get(&DataKey::Pass(*pass_id)) {
+                Some(p) => p,
+                None => continue,
+            };
+            if pass.tier_id == tier_id && pass.active && !pass.paused && pass.expires_at > now {
+                // Check if permission is in pass_permissions
+                for perm in pass.pass_permissions.iter() {
+                    if perm == &permission {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Check grant-based permissions
+        if let Some(grant) = env.storage().persistent().get(&DataKey::PermissionGrant(fan, tier_id)) {
+            if grant.expires_at > now {
+                for perm in grant.permissions.iter() {
+                    if perm == &permission {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    // --------------------------------------------------------
+    // Permission Grant Management
+    // --------------------------------------------------------
+
+    /// Grants temporary permissions to a fan for a tier.
+    ///
+    /// Creator-only. The creator can grant a subset of the tier's permissions to a fan
+    /// for a specified duration. The grant expires after the duration.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the caller is not the tier's creator.
+    /// - Panics if the tier does not exist.
+    /// - Panics if any permission is not in the tier's permissions.
+    pub fn grant_permission(
+        env: Env,
+        creator: Address,
+        fan: Address,
+        tier_id: u32,
+        permissions: Vec<Symbol>,
+        duration: u64,
+    ) {
+        creator.require_auth();
+
+        let tier: Tier = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Tier(tier_id))
+            .expect("Tier not found");
+        assert!(tier.creator == creator, "Not the tier creator");
+
+        // Validate that all permissions are in tier's permissions
+        for perm in permissions.iter() {
+            let mut found = false;
+            for tier_perm in tier.permissions.iter() {
+                if tier_perm == perm {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found, "Permission not in tier definition");
+        }
+
+        let now = env.ledger().timestamp();
+        let expires_at = now.saturating_add(duration);
+
+        let grant = PermissionGrant {
+            fan: fan.clone(),
+            tier_id,
+            permissions,
+            expires_at,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::PermissionGrant(fan, tier_id), &grant);
+
+        env.events().publish(
+            (Symbol::new(&env, "permission_granted"),),
+            (creator, fan, tier_id, expires_at),
+        );
+    }
+
+    /// Revokes a permission grant from a fan for a tier.
+    ///
+    /// Creator-only. Removes the grant, immediately revoking the fan's delegated permissions.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the caller is not the tier's creator.
+    /// - Panics if no grant exists for the fan and tier.
+    pub fn revoke_permission_grant(env: Env, creator: Address, fan: Address, tier_id: u32) {
+        creator.require_auth();
+
+        let tier: Tier = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Tier(tier_id))
+            .expect("Tier not found");
+        assert!(tier.creator == creator, "Not the tier creator");
+
+        let grant: PermissionGrant = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PermissionGrant(fan.clone(), tier_id))
+            .expect("Grant not found");
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PermissionGrant(fan, tier_id));
+
+        env.events().publish(
+            (Symbol::new(&env, "permission_revoked"),),
+            (creator, fan, tier_id),
+        );
     }
 
     /// Returns the [`Pass`] struct for the given `pass_id`.
@@ -1963,8 +2139,9 @@ mod tests {
             &1_000_000i128,
             &2_592_000u64,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
-        client.mint_pass(&fan, &tier_id);
+        client.mint_pass(&fan, &tier_id, soroban_sdk::Vec::new(&env));
         assert_eq!(client.has_any_valid_pass(&fan, &creator), true);
 
         // Expire the pass by advancing time beyond expiry
@@ -1988,8 +2165,9 @@ mod tests {
     //         1_000_000i128,
     //         2_592_000u64,
     //         0u32,
+    //         soroban_sdk::Vec::new(&env),
     //     );
-    //     client.mint_pass(&fan, &tier_id);
+    //     client.mint_pass(&fan, &tier_id, soroban_sdk::Vec::new(&env));
     //     assert_eq!(client.has_any_valid_pass(&fan, &creator), true);
     //
     //     // Expire the pass by advancing time beyond expiry
@@ -2010,9 +2188,10 @@ mod tests {
             &1_000_000i128,
             &2_592_000u64,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
 
-        let pass_id = client.mint_pass(&fan, &tier_id);
+        let pass_id = client.mint_pass(&fan, &tier_id, soroban_sdk::Vec::new(&env));
         assert_eq!(pass_id, 1);
 
         let pass = client.get_pass(&pass_id);
@@ -2038,11 +2217,12 @@ mod tests {
             &1_000_000i128,
             &2_592_000u64,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
         let tier = client.get_tier(&tier_id);
         assert_eq!(tier.price, TierPriceMode::Fixed(1_000_000));
 
-        let pass_id = client.mint_pass(&fan, &tier_id);
+        let pass_id = client.mint_pass(&fan, &tier_id, soroban_sdk::Vec::new(&env));
         let pass = client.get_pass(&pass_id);
         assert_eq!(pass.active, true);
     }
@@ -2068,12 +2248,13 @@ mod tests {
             &1000i128,
             &2_592_000u64,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
 
         // Expected token amount: 1000 * 10_000_000 / 10 = 1_000_000_000.
         StellarAssetClient::new(&env, &token).mint(&fan, &2_000_000_000);
 
-        let pass_id = client.mint_pass(&fan, &tier_id);
+        let pass_id = client.mint_pass(&fan, &tier_id, soroban_sdk::Vec::new(&env));
         assert!(client.get_pass(&pass_id).active);
 
         env.ledger().set_timestamp(now + 3600 + 1);
@@ -2103,12 +2284,13 @@ mod tests {
             &1000i128,
             &2_592_000u64,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
 
         // Advance beyond the 300-second staleness window.
         env.ledger().set_timestamp(now + 301);
 
-        client.mint_pass(&fan, &tier_id);
+        client.mint_pass(&fan, &tier_id, soroban_sdk::Vec::new(&env));
     }
 
     #[test]
@@ -2125,9 +2307,10 @@ mod tests {
             &1000i128,
             &2_592_000u64,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
 
-        client.mint_pass(&fan, &tier_id);
+        client.mint_pass(&fan, &tier_id, soroban_sdk::Vec::new(&env));
     }
 
     #[test]
@@ -2154,10 +2337,11 @@ mod tests {
             &1_000_000i128,
             &2_592_000u64,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
 
         assert_eq!(client.has_valid_pass(&fan, &tier_id), false);
-        client.mint_pass(&fan, &tier_id);
+        client.mint_pass(&fan, &tier_id, soroban_sdk::Vec::new(&env));
         assert_eq!(client.has_valid_pass(&fan, &tier_id), true);
     }
 
@@ -2173,10 +2357,11 @@ mod tests {
             &1_000_000i128,
             &2_592_000u64,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
 
         let now = env.ledger().timestamp(); // ARRANGE: record time of purchase
-        client.mint_pass(&fan, &tier_id);
+        client.mint_pass(&fan, &tier_id, soroban_sdk::Vec::new(&env));
         // ACT: advance ledger past lock and process unlocked earnings
         env.ledger().set_timestamp(now + 3600 + 1);
         let res = client.process_unlocked_earnings(&creator);
@@ -2197,10 +2382,11 @@ mod tests {
             &1_000_000i128,
             &2_592_000u64,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
 
         let start = env.ledger().timestamp();
-        client.mint_pass(&fan, &tier_id);
+        client.mint_pass(&fan, &tier_id, soroban_sdk::Vec::new(&env));
         env.ledger().set_timestamp(start + 3600 + 1);
         let res = client.process_unlocked_earnings(&creator);
         assert_eq!(res, 1u32);
@@ -2223,10 +2409,11 @@ mod tests {
             &1_000_000i128,
             &2_592_000u64,
             &1u32,
+            soroban_sdk::Vec::new(&env),
         );
 
-        client.mint_pass(&fan, &tier_id);
-        let result = client.try_mint_pass(&fan, &tier_id);
+        client.mint_pass(&fan, &tier_id, soroban_sdk::Vec::new(&env));
+        let result = client.try_mint_pass(&fan, &tier_id, soroban_sdk::Vec::new(&env));
         assert!(result.is_err());
     }
 
@@ -2242,13 +2429,14 @@ mod tests {
             &1_000_000i128,
             &2_592_000u64,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
 
         client.deactivate_tier(&creator, &tier_id);
         let tier = client.get_tier(&tier_id);
         assert_eq!(tier.active, false);
 
-        let result = client.try_mint_pass(&fan, &tier_id);
+        let result = client.try_mint_pass(&fan, &tier_id, soroban_sdk::Vec::new(&env));
         assert!(result.is_err());
     }
 
@@ -2265,6 +2453,7 @@ mod tests {
             &0i128,
             &2_592_000u64,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
     }
 
@@ -2280,6 +2469,7 @@ mod tests {
             &1_000_000i128,
             &2_592_000u64,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
 
         client.update_tier_price(&creator, &tier_id, &2_000_000i128);
@@ -2303,11 +2493,12 @@ mod tests {
             &1_000_000i128,
             &duration,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
 
         // Mint pass at `start`; expires_at = start + duration
         env.ledger().set_timestamp(start);
-        client.mint_pass(&fan, &tier_id);
+        client.mint_pass(&fan, &tier_id, soroban_sdk::Vec::new(&env));
 
         // Before expiry: pass should be valid
         assert_eq!(client.has_valid_pass(&fan, &tier_id), true);
@@ -2333,9 +2524,10 @@ mod tests {
             &1_000_000i128,
             &duration,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
 
-        let pass_id = client.mint_pass(&fan, &tier_id);
+        let pass_id = client.mint_pass(&fan, &tier_id, soroban_sdk::Vec::new(&env));
         let original_expires_at = client.get_pass(&pass_id).expires_at;
         assert_eq!(original_expires_at, start + duration);
 
@@ -2376,9 +2568,10 @@ mod tests {
             &1_000_000i128,
             &duration,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
 
-        let pass_id = client.mint_pass(&fan, &tier_id);
+        let pass_id = client.mint_pass(&fan, &tier_id, soroban_sdk::Vec::new(&env));
         let original_expires_at = client.get_pass(&pass_id).expires_at;
 
         // Advance past expiry before renewing.
@@ -2407,9 +2600,10 @@ mod tests {
             &1_000_000i128,
             &2_592_000u64,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
 
-        let pass_id = client.mint_pass(&fan, &tier_id);
+        let pass_id = client.mint_pass(&fan, &tier_id, soroban_sdk::Vec::new(&env));
 
         let impostor = Address::generate(&env);
         let result = client.try_renew_pass(&impostor, &pass_id);
@@ -2429,6 +2623,7 @@ mod tests {
             &1_000_000i128,
             &2_592_000u64,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
         let tier2 = client.create_tier(
             &creator,
@@ -2436,10 +2631,11 @@ mod tests {
             &2_000_000i128,
             &2_592_000u64,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
 
-        client.mint_pass(&fan, &tier1);
-        client.mint_pass(&fan, &tier2);
+        client.mint_pass(&fan, &tier1, soroban_sdk::Vec::new(&env));
+        client.mint_pass(&fan, &tier2, soroban_sdk::Vec::new(&env));
 
         let passes = client.get_fan_passes(&fan);
         assert_eq!(passes.len(), 2);
@@ -2463,6 +2659,7 @@ mod tests {
             &10_000_000i128,
             &long_duration,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
 
         let tier2 = client.create_tier(
@@ -2471,13 +2668,14 @@ mod tests {
             &500_000i128,
             &short_duration,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
 
         env.ledger().set_timestamp(start);
-        let short_lived_pass_id = client.mint_pass(&fan, &tier2);
+        let short_lived_pass_id = client.mint_pass(&fan, &tier2, soroban_sdk::Vec::new(&env));
 
         env.ledger().set_timestamp(start + short_duration + 1);
-        let long_lived_pass_id = client.mint_pass(&fan, &tier1);
+        let long_lived_pass_id = client.mint_pass(&fan, &tier1, soroban_sdk::Vec::new(&env));
 
         let all_details = client.get_fan_pass_details(&fan);
         assert_eq!(all_details.len(), 2);
@@ -2526,6 +2724,7 @@ mod tests {
                 &1_000_000i128,
                 &2_592_000u64,
                 &0u32,
+                soroban_sdk::Vec::new(env),
             );
             let _ = i;
             ids.push_back(tier_id);
@@ -2607,11 +2806,11 @@ mod tests {
         let tier_c = tier_ids.get(2).unwrap();
 
         // Several mints on tier A, several on tier B, none on tier C.
-        client.mint_pass(&fan, &tier_a);
-        client.mint_pass(&fan, &tier_a);
-        client.mint_pass(&fan, &tier_a);
-        client.mint_pass(&fan, &tier_b);
-        client.mint_pass(&fan, &tier_b);
+        client.mint_pass(&fan, &tier_a, soroban_sdk::Vec::new(&env));
+        client.mint_pass(&fan, &tier_a, soroban_sdk::Vec::new(&env));
+        client.mint_pass(&fan, &tier_a, soroban_sdk::Vec::new(&env));
+        client.mint_pass(&fan, &tier_b, soroban_sdk::Vec::new(&env));
+        client.mint_pass(&fan, &tier_b, soroban_sdk::Vec::new(&env));
 
         assert_eq!(client.get_tier(&tier_a).minted, 3);
         assert_eq!(client.get_tier(&tier_b).minted, 2);
@@ -2632,6 +2831,7 @@ mod tests {
             &1_000_000i128,
             &2_592_000u64,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
 
         let impostor = Address::generate(&env);
@@ -2651,6 +2851,7 @@ mod tests {
             &1_000_000i128,
             &2_592_000u64,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
 
         let impostor = Address::generate(&env);
@@ -2687,10 +2888,11 @@ mod tests {
             &2_000_000i128,
             &2_592_000u64,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
 
         StellarAssetClient::new(&env, &token).mint(&fan, &100_000_000);
-        let pass_id = client.mint_pass(&fan, &tier_id);
+        let pass_id = client.mint_pass(&fan, &tier_id, soroban_sdk::Vec::new(&env));
 
         // Release the escrowed earning before checking balances (lock = 3600s)
         let mint_time = env.ledger().timestamp();
@@ -2906,8 +3108,9 @@ mod tests {
             &1_000_000i128,
             &2_592_000u64,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
-        let pass_id = client.mint_pass(&fan, &tier_id);
+        let pass_id = client.mint_pass(&fan, &tier_id, soroban_sdk::Vec::new(&env));
 
         // Manually mark the pass inactive via storage (simulate deactivation).
         // We reach into persistent storage directly in the test environment.
@@ -3048,6 +3251,7 @@ mod tests {
             &1_000_000i128,
             &86_400u64,
             &0u32, // 0 = unlimited
+            soroban_sdk::Vec::new(&env),
         );
 
         let meta = client.get_tier_collection_metadata(&tier_id);
@@ -3072,6 +3276,7 @@ mod tests {
             &1_000_000i128,
             &2_592_000u64,
             &0u32,
+            soroban_sdk::Vec::new(&env),
         );
         client.deactivate_tier(&creator, &tier_id);
 
@@ -3116,5 +3321,195 @@ mod tests {
             i128_to_decimal(i128::MIN, &mut buf),
             b"-170141183460469231731687303715884105728"
         );
+    }
+
+    // --------------------------------------------------------
+    // Permission System Tests
+    // --------------------------------------------------------
+
+    #[test]
+    fn test_pass_based_permission() {
+        let (env, contract_id, _admin, creator, fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+        client.register_creator(&creator);
+
+        let view_content = Symbol::new(&env, "view_content");
+        let join_discord = Symbol::new(&env, "join_discord");
+        let download_files = Symbol::new(&env, "download_files");
+
+        let mut permissions = soroban_sdk::Vec::new(&env);
+        permissions.push_back(view_content);
+        permissions.push_back(join_discord);
+        permissions.push_back(download_files);
+
+        let tier_id = client.create_tier(
+            &creator,
+            &String::from_str(&env, "Gold"),
+            &1_000_000i128,
+            &2_592_000u64,
+            &0u32,
+            permissions.clone(),
+        );
+
+        let mut pass_permissions = soroban_sdk::Vec::new(&env);
+        pass_permissions.push_back(view_content);
+        pass_permissions.push_back(join_discord);
+
+        client.mint_pass(&fan, &tier_id, pass_permissions.clone());
+
+        assert!(client.has_permission(&fan, &tier_id, view_content));
+        assert!(client.has_permission(&fan, &tier_id, join_discord));
+        assert!(!client.has_permission(&fan, &tier_id, download_files));
+    }
+
+    #[test]
+    fn test_grant_based_permission() {
+        let (env, contract_id, _admin, creator, fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+        client.register_creator(&creator);
+
+        let view_content = Symbol::new(&env, "view_content");
+        let join_discord = Symbol::new(&env, "join_discord");
+
+        let mut permissions = soroban_sdk::Vec::new(&env);
+        permissions.push_back(view_content);
+        permissions.push_back(join_discord);
+
+        let tier_id = client.create_tier(
+            &creator,
+            &String::from_str(&env, "Silver"),
+            &1_000_000i128,
+            &2_592_000u64,
+            &0u32,
+            permissions.clone(),
+        );
+
+        let mut grant_permissions = soroban_sdk::Vec::new(&env);
+        grant_permissions.push_back(view_content);
+
+        client.grant_permission(&creator, &fan, &tier_id, grant_permissions, &3600u64);
+
+        assert!(client.has_permission(&fan, &tier_id, view_content));
+        assert!(!client.has_permission(&fan, &tier_id, join_discord));
+    }
+
+    #[test]
+    fn test_expired_grant_returns_false() {
+        let (env, contract_id, _admin, creator, fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+        client.register_creator(&creator);
+
+        let view_content = Symbol::new(&env, "view_content");
+
+        let mut permissions = soroban_sdk::Vec::new(&env);
+        permissions.push_back(view_content);
+
+        let tier_id = client.create_tier(
+            &creator,
+            &String::from_str(&env, "Bronze"),
+            &1_000_000i128,
+            &2_592_000u64,
+            &0u32,
+            permissions.clone(),
+        );
+
+        let mut grant_permissions = soroban_sdk::Vec::new(&env);
+        grant_permissions.push_back(view_content);
+
+        client.grant_permission(&creator, &fan, &tier_id, grant_permissions, &100u64);
+
+        // Advance time past grant expiry
+        let now = env.ledger().timestamp();
+        env.ledger().set_timestamp(now + 101);
+
+        assert!(!client.has_permission(&fan, &tier_id, view_content));
+    }
+
+    #[test]
+    fn test_revoked_grant_returns_false() {
+        let (env, contract_id, _admin, creator, fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+        client.register_creator(&creator);
+
+        let view_content = Symbol::new(&env, "view_content");
+
+        let mut permissions = soroban_sdk::Vec::new(&env);
+        permissions.push_back(view_content);
+
+        let tier_id = client.create_tier(
+            &creator,
+            &String::from_str(&env, "Bronze"),
+            &1_000_000i128,
+            &2_592_000u64,
+            &0u32,
+            permissions.clone(),
+        );
+
+        let mut grant_permissions = soroban_sdk::Vec::new(&env);
+        grant_permissions.push_back(view_content);
+
+        client.grant_permission(&creator, &fan, &tier_id, grant_permissions, &3600u64);
+
+        assert!(client.has_permission(&fan, &tier_id, view_content));
+
+        client.revoke_permission_grant(&creator, &fan, &tier_id);
+
+        assert!(!client.has_permission(&fan, &tier_id, view_content));
+    }
+
+    #[test]
+    #[should_panic(expected = "Permission not in tier definition")]
+    fn test_permission_not_in_tier_definition() {
+        let (env, contract_id, _admin, creator, fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+        client.register_creator(&creator);
+
+        let view_content = Symbol::new(&env, "view_content");
+        let invalid_permission = Symbol::new(&env, "invalid_permission");
+
+        let mut permissions = soroban_sdk::Vec::new(&env);
+        permissions.push_back(view_content);
+
+        let tier_id = client.create_tier(
+            &creator,
+            &String::from_str(&env, "Bronze"),
+            &1_000_000i128,
+            &2_592_000u64,
+            &0u32,
+            permissions.clone(),
+        );
+
+        let mut grant_permissions = soroban_sdk::Vec::new(&env);
+        grant_permissions.push_back(invalid_permission);
+
+        client.grant_permission(&creator, &fan, &tier_id, grant_permissions, &3600u64);
+    }
+
+    #[test]
+    #[should_panic(expected = "Permission not in tier definition")]
+    fn test_mint_pass_with_invalid_permission() {
+        let (env, contract_id, _admin, creator, fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+        client.register_creator(&creator);
+
+        let view_content = Symbol::new(&env, "view_content");
+        let invalid_permission = Symbol::new(&env, "invalid_permission");
+
+        let mut permissions = soroban_sdk::Vec::new(&env);
+        permissions.push_back(view_content);
+
+        let tier_id = client.create_tier(
+            &creator,
+            &String::from_str(&env, "Bronze"),
+            &1_000_000i128,
+            &2_592_000u64,
+            &0u32,
+            permissions.clone(),
+        );
+
+        let mut pass_permissions = soroban_sdk::Vec::new(&env);
+        pass_permissions.push_back(invalid_permission);
+
+        client.mint_pass(&fan, &tier_id, pass_permissions);
     }
 }
