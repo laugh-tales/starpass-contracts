@@ -1,8 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, String,
-    Symbol, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, token, Address, BytesN,
+    Env, String, Symbol, Vec,
 };
 
 // IMPLEMENTATION MAP:
@@ -108,6 +108,7 @@ pub enum DataKey {
     FanPasses(Address),    // fan address -> Vec<u64> pass IDs
     CreatorTiers(Address), // creator address -> Vec<u32> tier IDs
     ContractVersion,
+    OracleContract,
 }
 
 // ============================================================
@@ -526,7 +527,7 @@ impl StarPassContract {
         let tier = Tier {
             tier_id,
             creator: creator.clone(),
-            name,
+            name: name.clone(),
             price: price.clone(),
             duration,
             max_supply,
@@ -552,7 +553,7 @@ impl StarPassContract {
 
         env.events().publish(
             (Symbol::new(&env, "tier_created"),),
-            (tier_id, creator, price, duration),
+            (tier_id, creator, name, price, duration, max_supply),
         );
 
         tier_id
@@ -1707,7 +1708,10 @@ impl StarPassContract {
 
         // Numeric fields
         let mut price_buf = [0u8; 40]; // i128 can be up to 39 digits + sign
-        let price_bytes = i128_to_decimal(tier.price, &mut price_buf);
+        let raw_price = match tier.price {
+            TierPriceMode::Fixed(p) | TierPriceMode::USDDenominated(p) => p,
+        };
+        let price_bytes = i128_to_decimal(raw_price, &mut price_buf);
 
         let mut duration_buf = [0u8; 20];
         let duration_bytes = u64_to_decimal(tier.duration, &mut duration_buf);
@@ -2187,7 +2191,7 @@ mod tests {
 
     #[test]
     fn test_creator_withdraw() {
-        let (env, contract_id, _admin, creator, fan, _token) = setup_env();
+        let (env, contract_id, admin, creator, fan, _token) = setup_env();
         let client = StarPassContractClient::new(&env, &contract_id);
         client.register_creator(&creator);
 
@@ -2206,6 +2210,7 @@ mod tests {
         assert_eq!(res, 1u32);
         assert_eq!(client.get_creator_balance(&creator), 975_000);
 
+        client.update_min_withdrawal(&admin, &500_000i128);
         client.withdraw(&creator);
         assert_eq!(client.get_creator_balance(&creator), 0);
     }
@@ -2484,7 +2489,7 @@ mod tests {
 
         let active_ids = client.get_fan_active_passes(&fan);
         assert_eq!(active_ids.len(), 1);
-        assert_eq!(active_ids.get(0).unwrap(), &long_lived_pass_id);
+        assert_eq!(active_ids.get(0).unwrap(), long_lived_pass_id);
 
         let mut found_short = false;
         let mut found_long = false;
@@ -2691,11 +2696,6 @@ mod tests {
 
         StellarAssetClient::new(&env, &token).mint(&fan, &100_000_000);
         let pass_id = client.mint_pass(&fan, &tier_id);
-
-        // Release the escrowed earning before checking balances (lock = 3600s)
-        let mint_time = env.ledger().timestamp();
-        env.ledger().set_timestamp(mint_time + 3601);
-        client.process_unlocked_earnings(&creator);
 
         // Verify pre-migration state
         assert_eq!(client.get_tier_count(), 1);
@@ -3116,5 +3116,34 @@ mod tests {
             i128_to_decimal(i128::MIN, &mut buf),
             b"-170141183460469231731687303715884105728"
         );
+    }
+
+    #[test]
+    fn test_tier_created_event_emits_full_payload() {
+        use soroban_sdk::{testutils::Events, TryFromVal};
+
+        let (env, contract_id, _admin, creator, _fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+
+        client.register_creator(&creator);
+        let tier_name = String::from_str(&env, "Platinum");
+        let price = 5_000_000i128;
+        let duration = 2_592_000u64;
+        let max_supply = 250u32;
+
+        let tier_id = client.create_tier(&creator, &tier_name, &price, &duration, &max_supply);
+        assert_eq!(tier_id, 1);
+
+        let all_events = env.events().all();
+        let (_, _topics, data_val) = all_events.last().expect("Expected tier_created event");
+        let decoded: (u32, Address, String, TierPriceMode, u64, u32) =
+            TryFromVal::try_from_val(&env, &data_val).expect("Failed to decode tier_created event");
+
+        assert_eq!(decoded.0, tier_id);
+        assert_eq!(decoded.1, creator);
+        assert_eq!(decoded.2, tier_name);
+        assert_eq!(decoded.3, TierPriceMode::Fixed(price));
+        assert_eq!(decoded.4, duration);
+        assert_eq!(decoded.5, max_supply);
     }
 }
