@@ -1,8 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, String,
-    Symbol, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, token, Address, BytesN,
+    Env, String, Symbol, Vec,
 };
 
 // IMPLEMENTATION MAP:
@@ -108,6 +108,7 @@ pub enum DataKey {
     FanPasses(Address),    // fan address -> Vec<u64> pass IDs
     CreatorTiers(Address), // creator address -> Vec<u32> tier IDs
     ContractVersion,
+    OracleContract,
 }
 
 // ============================================================
@@ -1365,6 +1366,38 @@ impl StarPassContract {
             .unwrap_or(0)
     }
 
+    /// Returns the total number of currently active, non-paused, and non-expired passes
+    /// across all creators and tiers on the platform.
+    ///
+    /// Read-only, no auth required. Iterates passes from `1..=pass_count` and counts
+    /// those where `pass.active && !pass.paused && pass.expires_at > current_ledger_timestamp`.
+    ///
+    /// # Gas / Resource Note
+    /// Because this query performs an O(N) scan over all minted pass IDs (`1..=pass_count`),
+    /// gas and ledger-entry read costs grow linearly with total platform passes. Intended
+    /// primarily for off-chain simulation / RPC view calls.
+    pub fn get_active_pass_count(env: Env) -> u64 {
+        let pass_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PassCount)
+            .unwrap_or(0);
+        if pass_count == 0 {
+            return 0;
+        }
+
+        let now = env.ledger().timestamp();
+        let mut active_count: u64 = 0;
+        for pass_id in 1..=pass_count {
+            if let Some(pass) = env.storage().persistent().get::<_, Pass>(&DataKey::Pass(pass_id)) {
+                if pass.active && !pass.paused && pass.expires_at > now {
+                    active_count += 1;
+                }
+            }
+        }
+        active_count
+    }
+
     /// Returns the total number of tiers ever created across all creators.
     ///
     /// Read-only, no auth required. Returns `0` before any tiers are created.
@@ -1707,7 +1740,10 @@ impl StarPassContract {
 
         // Numeric fields
         let mut price_buf = [0u8; 40]; // i128 can be up to 39 digits + sign
-        let price_bytes = i128_to_decimal(tier.price, &mut price_buf);
+        let raw_price = match tier.price {
+            TierPriceMode::Fixed(p) | TierPriceMode::USDDenominated(p) => p,
+        };
+        let price_bytes = i128_to_decimal(raw_price, &mut price_buf);
 
         let mut duration_buf = [0u8; 20];
         let duration_bytes = u64_to_decimal(tier.duration, &mut duration_buf);
@@ -2187,7 +2223,7 @@ mod tests {
 
     #[test]
     fn test_creator_withdraw() {
-        let (env, contract_id, _admin, creator, fan, _token) = setup_env();
+        let (env, contract_id, admin, creator, fan, _token) = setup_env();
         let client = StarPassContractClient::new(&env, &contract_id);
         client.register_creator(&creator);
 
@@ -2206,6 +2242,7 @@ mod tests {
         assert_eq!(res, 1u32);
         assert_eq!(client.get_creator_balance(&creator), 975_000);
 
+        client.update_min_withdrawal(&admin, &500_000i128);
         client.withdraw(&creator);
         assert_eq!(client.get_creator_balance(&creator), 0);
     }
@@ -2484,7 +2521,7 @@ mod tests {
 
         let active_ids = client.get_fan_active_passes(&fan);
         assert_eq!(active_ids.len(), 1);
-        assert_eq!(active_ids.get(0).unwrap(), &long_lived_pass_id);
+        assert_eq!(active_ids.get(0).unwrap(), long_lived_pass_id);
 
         let mut found_short = false;
         let mut found_long = false;
@@ -2691,11 +2728,6 @@ mod tests {
 
         StellarAssetClient::new(&env, &token).mint(&fan, &100_000_000);
         let pass_id = client.mint_pass(&fan, &tier_id);
-
-        // Release the escrowed earning before checking balances (lock = 3600s)
-        let mint_time = env.ledger().timestamp();
-        env.ledger().set_timestamp(mint_time + 3601);
-        client.process_unlocked_earnings(&creator);
 
         // Verify pre-migration state
         assert_eq!(client.get_tier_count(), 1);
@@ -3116,5 +3148,58 @@ mod tests {
             i128_to_decimal(i128::MIN, &mut buf),
             b"-170141183460469231731687303715884105728"
         );
+    }
+
+    #[test]
+    fn test_get_pass_count_and_active_pass_count() {
+        let (env, contract_id, _admin, creator, fan, token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+
+        assert_eq!(client.get_pass_count(), 0);
+        assert_eq!(client.get_active_pass_count(), 0);
+
+        client.register_creator(&creator);
+        let short_tier = client.create_tier(
+            &creator,
+            &String::from_str(&env, "Short"),
+            &1_000_000i128,
+            &100u64,
+            &0u32,
+        );
+        let long_tier = client.create_tier(
+            &creator,
+            &String::from_str(&env, "Long"),
+            &2_000_000i128,
+            &1_000u64,
+            &0u32,
+        );
+
+        let fan2 = Address::generate(&env);
+        let stellar_asset = token::StellarAssetClient::new(&env, &token);
+        stellar_asset.mint(&fan2, &100_000_000);
+
+        env.ledger().set_timestamp(1_000);
+        let pass1 = client.mint_pass(&fan, &short_tier);
+        let pass2 = client.mint_pass(&fan, &long_tier);
+        let _pass3 = client.mint_pass(&fan2, &long_tier);
+
+        assert_eq!(client.get_pass_count(), 3);
+        assert_eq!(client.get_active_pass_count(), 3);
+
+        // Pause pass2 -> active pass count drops to 2 while total pass count stays 3.
+        client.pause_pass(&fan, &pass2);
+        assert_eq!(client.get_pass_count(), 3);
+        assert_eq!(client.get_active_pass_count(), 2);
+
+        // Advance time past short_tier expiry (1_000 + 100 = 1_100).
+        env.ledger().set_timestamp(1_101);
+        assert!(!client.has_valid_pass(&fan, &short_tier));
+        assert_eq!(pass1, 1);
+        assert_eq!(client.get_pass_count(), 3);
+        assert_eq!(client.get_active_pass_count(), 1);
+
+        // Resume pass2 -> active pass count increases back to 2.
+        client.resume_pass(&fan, &pass2);
+        assert_eq!(client.get_active_pass_count(), 2);
     }
 }
