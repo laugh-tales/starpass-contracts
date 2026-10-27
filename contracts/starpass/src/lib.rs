@@ -1,8 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, String,
-    Symbol, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, token, Address, BytesN,
+    Env, String, Symbol, Vec,
 };
 
 // IMPLEMENTATION MAP:
@@ -107,7 +107,9 @@ pub enum DataKey {
     EarlyReleaseProposal(u64),
     FanPasses(Address),    // fan address -> Vec<u64> pass IDs
     CreatorTiers(Address), // creator address -> Vec<u32> tier IDs
+    CreatorTotalRevenue(Address), // cumulative revenue earned by creator across all pass purchases
     ContractVersion,
+    OracleContract,
 }
 
 // ============================================================
@@ -763,7 +765,7 @@ impl StarPassContract {
             (tier.creator.clone(), earning_id, creator_amount, unlocks_at),
         );
 
-        // Update creator profile
+        // Update creator profile and cumulative total revenue
         let mut creator_profile: Creator = env
             .storage()
             .persistent()
@@ -774,6 +776,16 @@ impl StarPassContract {
         env.storage()
             .persistent()
             .set(&DataKey::Creator(tier.creator.clone()), &creator_profile);
+
+        let prev_total_revenue: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CreatorTotalRevenue(tier.creator.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::CreatorTotalRevenue(tier.creator.clone()),
+            &(prev_total_revenue + creator_amount),
+        );
 
         // Mint the pass
         let pass_count: u64 = env
@@ -913,7 +925,7 @@ impl StarPassContract {
             (tier.creator.clone(), earning_id, creator_amount, unlocks_at),
         );
 
-        // Update creator profile
+        // Update creator profile and cumulative total revenue
         let mut creator_profile: Creator = env
             .storage()
             .persistent()
@@ -923,6 +935,16 @@ impl StarPassContract {
         env.storage()
             .persistent()
             .set(&DataKey::Creator(tier.creator.clone()), &creator_profile);
+
+        let prev_total_revenue: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CreatorTotalRevenue(tier.creator.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::CreatorTotalRevenue(tier.creator.clone()),
+            &(prev_total_revenue + creator_amount),
+        );
 
         // Extend from whichever is later — rewards early renewal by not
         // discarding remaining time on the existing pass.
@@ -1355,6 +1377,17 @@ impl StarPassContract {
             .unwrap_or(0)
     }
 
+    /// Returns the cumulative total revenue (in stroops, net of protocol fees) ever earned
+    /// by the given creator across all pass purchases and renewals, regardless of withdrawals.
+    ///
+    /// Read-only, no auth required. Returns `0` if the creator has earned nothing or is not registered.
+    pub fn get_creator_total_revenue(env: Env, creator: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CreatorTotalRevenue(creator))
+            .unwrap_or(0)
+    }
+
     /// Returns the total number of passes ever minted across all creators and tiers.
     ///
     /// Read-only, no auth required. Returns `0` before any passes are minted.
@@ -1707,7 +1740,10 @@ impl StarPassContract {
 
         // Numeric fields
         let mut price_buf = [0u8; 40]; // i128 can be up to 39 digits + sign
-        let price_bytes = i128_to_decimal(tier.price, &mut price_buf);
+        let raw_price = match tier.price {
+            TierPriceMode::Fixed(p) | TierPriceMode::USDDenominated(p) => p,
+        };
+        let price_bytes = i128_to_decimal(raw_price, &mut price_buf);
 
         let mut duration_buf = [0u8; 20];
         let duration_bytes = u64_to_decimal(tier.duration, &mut duration_buf);
@@ -2187,7 +2223,7 @@ mod tests {
 
     #[test]
     fn test_creator_withdraw() {
-        let (env, contract_id, _admin, creator, fan, _token) = setup_env();
+        let (env, contract_id, admin, creator, fan, _token) = setup_env();
         let client = StarPassContractClient::new(&env, &contract_id);
         client.register_creator(&creator);
 
@@ -2206,6 +2242,7 @@ mod tests {
         assert_eq!(res, 1u32);
         assert_eq!(client.get_creator_balance(&creator), 975_000);
 
+        client.update_min_withdrawal(&admin, &500_000i128);
         client.withdraw(&creator);
         assert_eq!(client.get_creator_balance(&creator), 0);
     }
@@ -2484,7 +2521,7 @@ mod tests {
 
         let active_ids = client.get_fan_active_passes(&fan);
         assert_eq!(active_ids.len(), 1);
-        assert_eq!(active_ids.get(0).unwrap(), &long_lived_pass_id);
+        assert_eq!(active_ids.get(0).unwrap(), long_lived_pass_id);
 
         let mut found_short = false;
         let mut found_long = false;
@@ -2691,11 +2728,6 @@ mod tests {
 
         StellarAssetClient::new(&env, &token).mint(&fan, &100_000_000);
         let pass_id = client.mint_pass(&fan, &tier_id);
-
-        // Release the escrowed earning before checking balances (lock = 3600s)
-        let mint_time = env.ledger().timestamp();
-        env.ledger().set_timestamp(mint_time + 3601);
-        client.process_unlocked_earnings(&creator);
 
         // Verify pre-migration state
         assert_eq!(client.get_tier_count(), 1);
@@ -3116,5 +3148,46 @@ mod tests {
             i128_to_decimal(i128::MIN, &mut buf),
             b"-170141183460469231731687303715884105728"
         );
+    }
+
+    #[test]
+    fn test_get_creator_total_revenue_persists_across_purchases_and_withdrawals() {
+        let (env, contract_id, admin, creator, fan, _token) = setup_env();
+        let client = StarPassContractClient::new(&env, &contract_id);
+
+        // Unregistered creator returns 0
+        assert_eq!(client.get_creator_total_revenue(&creator), 0);
+
+        client.register_creator(&creator);
+        assert_eq!(client.get_creator_total_revenue(&creator), 0);
+
+        let tier_id = client.create_tier(
+            &creator,
+            &String::from_str(&env, "VIP"),
+            &1_000_000i128,
+            &2_592_000u64,
+            &0u32,
+        );
+
+        let start = env.ledger().timestamp();
+        // First pass purchase: price = 1_000_000, fee = 2.5% (25_000), creator share = 975_000
+        let pass_id = client.mint_pass(&fan, &tier_id);
+        assert_eq!(client.get_creator_total_revenue(&creator), 975_000);
+
+        // Second purchase (renewal): adds another 975_000 -> 1_950_000
+        client.renew_pass(&fan, &pass_id);
+        assert_eq!(client.get_creator_total_revenue(&creator), 1_950_000);
+
+        // Unlock earnings and withdraw full balance
+        env.ledger().set_timestamp(start + 3600 + 1);
+        client.process_unlocked_earnings(&creator);
+        assert_eq!(client.get_creator_balance(&creator), 1_950_000);
+
+        client.update_min_withdrawal(&admin, &500_000i128);
+        client.withdraw(&creator);
+        assert_eq!(client.get_creator_balance(&creator), 0);
+
+        // Cumulative total revenue must NOT decrease after withdrawal
+        assert_eq!(client.get_creator_total_revenue(&creator), 1_950_000);
     }
 }
